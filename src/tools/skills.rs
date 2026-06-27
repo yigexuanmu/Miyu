@@ -1,4 +1,5 @@
 use super::{ToolRegistry, ToolSpec};
+use crate::config::AppConfig;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -6,20 +7,63 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 
+pub fn skills_prompt(config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
+    let skills_dir = config.active_persona_skills_dir(paths);
+    if !skills_dir.exists() {
+        return Ok(String::new());
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.path().join(".disabled").exists() {
+            continue;
+        }
+        let skill_file = entry.path().join("SKILL.md");
+        if !skill_file.is_file() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&skill_file)?;
+        let name = frontmatter_value(&raw, "name")
+            .or_else(|| entry.file_name().to_str().map(ToString::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        let description = frontmatter_value(&raw, "description").unwrap_or_default();
+        let body = strip_frontmatter(&raw);
+        entries.push(format!(
+            "- {name}: {description}\n  {}",
+            compact_skill_body(&body)
+        ));
+    }
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "<available-skills>\n这些是已安装的 skills。遇到匹配任务时主动参考。当前不支持创建、保存或自动生成新的 skill；不要把 skill 内容保存到知识库。\n{}\n</available-skills>",
+        entries.join("\n")
+    ))
+}
+
 pub fn register_skills(
     registry: &mut ToolRegistry,
+    config: &AppConfig,
     paths: &MiyuPaths,
     allow_command_execution: bool,
 ) -> Result<()> {
-    if !paths.skills_dir.exists() {
+    let skills_dir = config.active_persona_skills_dir(paths);
+    if !skills_dir.exists() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(&paths.skills_dir)? {
+    for entry in std::fs::read_dir(&skills_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let skill_dir = entry.path();
+        if skill_dir.join(".disabled").exists() {
+            continue;
+        }
         let skill_file = skill_dir.join("SKILL.md");
         if !skill_file.is_file() {
             continue;
@@ -121,4 +165,26 @@ fn frontmatter_value(raw: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn strip_frontmatter(raw: &str) -> String {
+    let mut lines = raw.lines();
+    if lines.next() != Some("---") {
+        return raw.to_string();
+    }
+    for line in lines.by_ref() {
+        if line == "---" {
+            return lines.collect::<Vec<_>>().join("\n");
+        }
+    }
+    raw.to_string()
+}
+
+fn compact_skill_body(body: &str) -> String {
+    let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > 700 {
+        format!("{}...", text.chars().take(697).collect::<String>())
+    } else {
+        text
+    }
 }

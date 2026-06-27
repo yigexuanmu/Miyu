@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, ProviderConfig};
+use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -9,6 +10,7 @@ use crossterm::{execute, queue};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -162,14 +164,16 @@ fn plugin_row(state: &str, name: &str, description: &str, width: usize) -> Strin
     fixed + &truncate(description, remaining)
 }
 
-fn plugin_names() -> [(&'static str, &'static str, &'static str); 6] {
+fn plugin_names() -> [(&'static str, &'static str, &'static str); 8] {
     [
         ("web", "网络搜索", "搜索 API 与脚本 fallback"),
         ("deep_research", "深度研究", "长任务研究并输出 Markdown"),
         ("vision", "识图", "图片理解和终端预览"),
         ("image_generation", "生图", "文本生成图片"),
+        ("web_images", "搜图", "网络图片搜索、下载与审核"),
         ("print_image", "打印图片", "终端图片打印尺寸"),
         ("knowledge_base", "知识库", "本地文件检索与语义索引"),
+        ("memory", "记忆", "长期记忆与联想"),
     ]
 }
 
@@ -179,8 +183,10 @@ fn plugin_enabled(config: &AppConfig, index: usize) -> bool {
         1 => config.plugins.deep_research.enabled,
         2 => config.plugins.vision.enabled,
         3 => config.plugins.image_generation.enabled,
-        4 => config.plugins.print_image.enabled,
-        5 => config.plugins.knowledge_base.enabled,
+        4 => config.plugins.web_images.enabled,
+        5 => config.plugins.print_image.enabled,
+        6 => config.plugins.knowledge_base.enabled,
+        7 => config.plugins.memory.enabled,
         _ => false,
     }
 }
@@ -192,8 +198,10 @@ fn toggle_plugin(config: &mut AppConfig, index: usize) {
         1 => config.plugins.deep_research.enabled = value,
         2 => config.plugins.vision.enabled = value,
         3 => config.plugins.image_generation.enabled = value,
-        4 => config.plugins.print_image.enabled = value,
-        5 => config.plugins.knowledge_base.enabled = value,
+        4 => config.plugins.web_images.enabled = value,
+        5 => config.plugins.print_image.enabled = value,
+        6 => config.plugins.knowledge_base.enabled = value,
+        7 => config.plugins.memory.enabled = value,
         _ => {}
     }
 }
@@ -273,7 +281,7 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                 "优先当前多模态模型",
                 config.plugins.vision.prefer_current_multimodal_model,
             ),
-            Field::new("专用识图 Provider/模型", vision_provider_value(config))
+            Field::new("识图 Provider/模型", vision_provider_value(config))
                 .choices_owned(provider_model_choice_values(config, true)),
         ],
         3 => vec![
@@ -312,6 +320,31 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
             ),
         ],
         4 => vec![
+            Field::boolean("启用", config.plugins.web_images.enabled),
+            Field::boolean(
+                "视觉模型审核",
+                config.plugins.web_images.vision_screening_enabled,
+            ),
+            Field::new(
+                "数量上限",
+                config.plugins.web_images.max_results.to_string(),
+            ),
+            Field::boolean("安全搜索", config.plugins.web_images.safe_search),
+            Field::boolean("自动预览", config.plugins.web_images.auto_preview),
+            Field::new(
+                "默认预览数量",
+                config.plugins.web_images.preview_count.to_string(),
+            ),
+            Field::new(
+                "最大下载 MB",
+                config.plugins.web_images.max_download_mb.to_string(),
+            ),
+            Field::new(
+                "超时秒数",
+                config.plugins.web_images.timeout_seconds.to_string(),
+            ),
+        ],
+        5 => vec![
             Field::boolean("启用", config.plugins.print_image.enabled),
             Field::new(
                 "打印宽度百分比",
@@ -322,7 +355,7 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                 config.plugins.print_image.height_percent.to_string(),
             ),
         ],
-        5 => vec![
+        6 => vec![
             Field::boolean("启用", config.plugins.knowledge_base.enabled),
             Field::new("知识库目录", config.plugins.knowledge_base.data_dir.clone()),
             Field::new(
@@ -407,6 +440,41 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                     .to_string(),
             ),
         ],
+        7 => vec![
+            Field::boolean("启用", config.plugins.memory.enabled),
+            Field::boolean(
+                "上下文弹出缓存",
+                config.plugins.memory.evicted_context_enabled,
+            ),
+            Field::boolean("联想启用", config.plugins.memory.association_enabled),
+            Field::boolean("自动日记", config.plugins.memory.auto_diary_enabled),
+            Field::boolean("自动知识记忆", config.plugins.memory.auto_fact_enabled),
+            Field::new(
+                "联想知识条数",
+                config.plugins.memory.association_facts.to_string(),
+            ),
+            Field::new(
+                "联想事件条数",
+                config.plugins.memory.association_episodes.to_string(),
+            ),
+            Field::new(
+                "联想字符上限",
+                config.plugins.memory.association_max_chars.to_string(),
+            ),
+            Field::boolean("遗忘启用", config.plugins.memory.forgetting_enabled),
+            Field::new(
+                "遗忘半衰期天",
+                config.plugins.memory.forgetting_half_life_days.to_string(),
+            ),
+            Field::new(
+                "遗忘最低强度",
+                config.plugins.memory.forgetting_min_strength.to_string(),
+            ),
+            Field::new(
+                "回忆增强强度",
+                config.plugins.memory.forgetting_review_boost.to_string(),
+            ),
+        ],
         _ => vec![Field::boolean("启用", plugin_enabled(config, index))],
     }
 }
@@ -456,11 +524,26 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
             config.plugins.image_generation.timeout_seconds = fields[9].value.trim().parse()?;
         }
         4 => {
+            config.plugins.web_images.enabled = parse_bool_field(&fields[0].value)?;
+            config.plugins.web_images.vision_screening_enabled =
+                parse_bool_field(&fields[1].value)?;
+            config.plugins.web_images.max_results =
+                fields[2].value.trim().parse::<usize>()?.clamp(1, 10);
+            config.plugins.web_images.safe_search = parse_bool_field(&fields[3].value)?;
+            config.plugins.web_images.auto_preview = parse_bool_field(&fields[4].value)?;
+            config.plugins.web_images.preview_count =
+                fields[5].value.trim().parse::<usize>()?.min(5);
+            config.plugins.web_images.max_download_mb =
+                fields[6].value.trim().parse::<f64>()?.clamp(0.1, 50.0);
+            config.plugins.web_images.timeout_seconds =
+                fields[7].value.trim().parse::<u64>()?.clamp(5, 120);
+        }
+        5 => {
             config.plugins.print_image.enabled = parse_bool_field(&fields[0].value)?;
             config.plugins.print_image.width_percent = fields[1].value.trim().parse::<u8>()?;
             config.plugins.print_image.height_percent = fields[2].value.trim().parse::<u8>()?;
         }
-        5 => {
+        6 => {
             config.plugins.knowledge_base.enabled = parse_bool_field(&fields[0].value)?;
             config.plugins.knowledge_base.data_dir = fields[1].value.trim().to_string();
             config.plugins.knowledge_base.max_search_results = fields[2].value.trim().parse()?;
@@ -484,6 +567,25 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
             config.plugins.knowledge_base.embedding_timeout_seconds =
                 fields[15].value.trim().parse()?;
         }
+        7 => {
+            config.plugins.memory.enabled = parse_bool_field(&fields[0].value)?;
+            config.plugins.memory.evicted_context_enabled = parse_bool_field(&fields[1].value)?;
+            config.plugins.memory.association_enabled = parse_bool_field(&fields[2].value)?;
+            config.plugins.memory.auto_diary_enabled = parse_bool_field(&fields[3].value)?;
+            config.plugins.memory.auto_fact_enabled = parse_bool_field(&fields[4].value)?;
+            config.plugins.memory.auto_skill_enabled = false;
+            config.plugins.memory.association_facts = fields[5].value.trim().parse::<usize>()?;
+            config.plugins.memory.association_episodes = fields[6].value.trim().parse::<usize>()?;
+            config.plugins.memory.association_max_chars =
+                fields[7].value.trim().parse::<usize>()?;
+            config.plugins.memory.forgetting_enabled = parse_bool_field(&fields[8].value)?;
+            config.plugins.memory.forgetting_half_life_days =
+                fields[9].value.trim().parse::<f64>()?;
+            config.plugins.memory.forgetting_min_strength =
+                fields[10].value.trim().parse::<f64>()?;
+            config.plugins.memory.forgetting_review_boost =
+                fields[11].value.trim().parse::<f64>()?;
+        }
         _ => {
             let value = parse_bool_field(&fields[0].value)?;
             if plugin_enabled(config, index) != value {
@@ -502,7 +604,7 @@ fn edit_custom_prompts(
     let mut selected = 0usize;
     loop {
         let persona = if config.prompt.active_persona.trim().is_empty() {
-            "Miyu".to_string()
+            "内置默认".to_string()
         } else {
             persona_display_name(&config.prompt.active_persona).to_string()
         };
@@ -536,7 +638,7 @@ fn edit_personas(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppCon
         } else {
             "  "
         };
-        options.push(format!("{default_marker}Miyu"));
+        options.push(format!("{default_marker}内置默认"));
         options.extend(personas.iter().map(|name| {
             let display = persona_display_name(name);
             if *name == config.prompt.active_persona {
@@ -572,6 +674,7 @@ fn edit_personas(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppCon
             KeyCode::Enter if selected > 0 => {
                 if let Some(name) = personas.get(selected - 1) {
                     if let Some(new_name) = edit_persona(stdout, paths, config, name)? {
+                        move_persona_scope(paths, config, name, &new_name)?;
                         if config.prompt.active_persona == *name {
                             config.prompt.active_persona = new_name;
                         }
@@ -584,6 +687,7 @@ fn edit_personas(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppCon
                     if path.exists() {
                         std::fs::remove_file(path)?;
                     }
+                    remove_persona_scope(paths, config, name)?;
                     if config.prompt.active_persona == *name {
                         config.prompt.active_persona.clear();
                     }
@@ -631,6 +735,58 @@ fn edit_persona(
             write_persona(paths, config, name, content)
         },
     )
+}
+
+fn move_persona_scope(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    if old_name == new_name {
+        return Ok(());
+    }
+    move_dir_if_exists(
+        config.persona_memory_data_dir(paths, old_name),
+        config.persona_memory_data_dir(paths, new_name),
+    )?;
+    move_dir_if_exists(
+        config.persona_memory_state_dir(paths, old_name),
+        config.persona_memory_state_dir(paths, new_name),
+    )?;
+    move_dir_if_exists(
+        config.persona_skills_dir(paths, old_name),
+        config.persona_skills_dir(paths, new_name),
+    )?;
+    Ok(())
+}
+
+fn remove_persona_scope(paths: &MiyuPaths, config: &AppConfig, name: &str) -> Result<()> {
+    remove_dir_if_exists(config.persona_memory_data_dir(paths, name))?;
+    remove_dir_if_exists(config.persona_memory_state_dir(paths, name))?;
+    remove_dir_if_exists(config.persona_skills_dir(paths, name))?;
+    Ok(())
+}
+
+fn move_dir_if_exists(from: PathBuf, to: PathBuf) -> Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if to.exists() {
+        std::fs::remove_dir_all(&to)?;
+    }
+    std::fs::rename(from, to)?;
+    Ok(())
+}
+
+fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 fn edit_identities(
@@ -1151,16 +1307,11 @@ impl<'a> ProviderBrowser<'a> {
             self.models.get(self.model_idx),
         ) {
             if let Some(index) = provider.models.iter().position(|item| item == &model.full) {
-                if provider.models.len() > 1 {
-                    provider.models.remove(index);
-                    if provider.default_model == model.full {
-                        provider.default_model =
-                            provider.models.first().cloned().unwrap_or_default();
-                    }
-                    self.status = format!("已取消激活模型: {}", model.full);
-                } else {
-                    self.status = "至少需要保留一个激活模型".to_string();
+                provider.models.remove(index);
+                if provider.default_model == model.full {
+                    provider.default_model = provider.models.first().cloned().unwrap_or_default();
                 }
+                self.status = format!("已取消激活模型: {}", model.full);
             } else {
                 provider.models.push(model.full.clone());
                 if provider.default_model.trim().is_empty() {
@@ -1309,11 +1460,14 @@ impl ModelEntry {
 
 fn fetch_models(provider: &ProviderConfig) -> Result<Vec<String>> {
     let api_key = provider.api_key.as_deref().unwrap_or_default();
-    let api_key = if let Some(env_name) = api_key.strip_prefix("$env:") {
+    let mut api_key = if let Some(env_name) = api_key.strip_prefix("$env:") {
         std::env::var(env_name).unwrap_or_default()
     } else {
         api_key.to_string()
     };
+    if api_key.is_empty() && provider.is_opencode_zen() {
+        api_key = "public".to_string();
+    }
     let url = models_url(&provider.base_url);
     let mut request = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
@@ -1484,23 +1638,20 @@ fn edit_model_form(
         if !provider.models.iter().any(|item| item == model) {
             provider.models.push(model.to_string());
         }
-    } else if provider.models.len() > 1 {
+    } else {
         provider.models.retain(|item| item != model);
     }
     if current || provider.default_model == model && !active {
         provider.default_model = if active {
             model.to_string()
         } else {
-            provider
-                .models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| model.to_string())
+            provider.models.first().cloned().unwrap_or_default()
         };
-        if !provider
-            .models
-            .iter()
-            .any(|item| item == &provider.default_model)
+        if !provider.default_model.is_empty()
+            && !provider
+                .models
+                .iter()
+                .any(|item| item == &provider.default_model)
         {
             provider.models.push(provider.default_model.clone());
         }
@@ -1716,7 +1867,9 @@ fn choice_label(choice: &str) -> String {
 fn provider_model_choice_values(config: &AppConfig, include_current: bool) -> Vec<String> {
     let mut choices = Vec::new();
     if include_current {
-        choices.push(String::new());
+        choices.push(format!(
+            "{OPENCODE_PROVIDER_ID}\t{OPENCODE_DEFAULT_VISION_MODEL}"
+        ));
     }
     choices.extend(
         config
@@ -1730,7 +1883,7 @@ fn provider_model_choice_values(config: &AppConfig, include_current: bool) -> Ve
 fn vision_provider_value(config: &AppConfig) -> String {
     let vision = &config.plugins.vision;
     if vision.vision_provider_id.trim().is_empty() {
-        String::new()
+        format!("{OPENCODE_PROVIDER_ID}\t{OPENCODE_DEFAULT_VISION_MODEL}")
     } else if vision.vision_model.trim().is_empty() {
         config
             .provider(Some(vision.vision_provider_id.trim()))

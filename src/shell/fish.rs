@@ -1,3 +1,4 @@
+use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::Result;
 
@@ -27,6 +28,10 @@ pub fn install(paths: &MiyuPaths) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&paths.fish_hook_file, hook())?;
-    println!("installed fish hook: {}", paths.fish_hook_file.display());
+    println!(
+        "{}: {}",
+        t("installed fish hook", "已安装 fish hook"),
+        paths.fish_hook_file.display()
+    );
     Ok(())
 }

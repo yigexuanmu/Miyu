@@ -7,12 +7,14 @@ mod hash_codec;
 mod image_generation;
 pub mod knowledge_base;
 mod man;
+mod memory;
 mod moegirl;
 mod registry;
 mod skills;
 mod vision;
 mod weather;
 mod web;
+mod web_images;
 mod xuanxue;
 
 use crate::config::AppConfig;
@@ -20,7 +22,7 @@ use crate::paths::MiyuPaths;
 
 #[allow(unused_imports)]
 pub use registry::{empty_parameters, ToolRegistry, ToolSpec};
-pub use skills::register_skills;
+pub use skills::{register_skills, skills_prompt};
 
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -38,17 +40,15 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
     }
+    if config.plugins.web_images.enabled {
+        web_images::register(&mut registry, config.clone(), paths.clone(), true);
+    }
     if config.plugins.deep_research.enabled {
         let research_tools = registry.clone();
         deep_research::register(&mut registry, config.clone(), paths.clone(), research_tools);
     }
     if config.plugins.vision.enabled {
-        vision::register(
-            &mut registry,
-            config.clone(),
-            paths.clone(),
-            should_register_vision_analyze(config),
-        );
+        vision::register(&mut registry, config.clone(), paths.clone(), true);
     }
     if config.plugins.image_generation.enabled {
         image_generation::register(&mut registry, config.clone());
@@ -56,39 +56,29 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.knowledge_base.enabled {
         knowledge_base::register(&mut registry, config.clone(), paths.clone());
     }
+    if config.memory_config().enabled {
+        memory::register(&mut registry, config.clone(), paths.clone());
+    }
     registry
 }
 
-fn should_register_vision_analyze(config: &AppConfig) -> bool {
-    let vision = &config.plugins.vision;
-    if !vision.vision_provider_id.trim().is_empty() {
-        return true;
+pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    default_tools::register_readonly(&mut registry);
+    web::register_fetch(&mut registry);
+    archlinux::register(&mut registry);
+    man::register(&mut registry);
+    if config.plugins.web.enabled {
+        web::register(&mut registry, config.plugins.web.clone());
     }
-    if !vision.prefer_current_multimodal_model {
-        return true;
+    if config.plugins.web_images.enabled {
+        web_images::register(&mut registry, config.clone(), paths.clone(), false);
     }
-    let Ok(provider) = config.provider(None) else {
-        return true;
-    };
-    !looks_multimodal_model(&provider.default_model)
-}
-
-fn looks_multimodal_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    [
-        "vision",
-        "vl",
-        "multimodal",
-        "omni",
-        "qwen-vl",
-        "qwen2-vl",
-        "qwen2.5-vl",
-        "qwen3-vl",
-        "gpt-4o",
-        "gemini",
-        "pixtral",
-        "llava",
-    ]
-    .iter()
-    .any(|needle| model.contains(needle))
+    if config.plugins.knowledge_base.enabled {
+        knowledge_base::register_readonly(&mut registry, config.clone(), paths.clone());
+    }
+    if config.memory_config().enabled {
+        memory::register_readonly(&mut registry, config.clone(), paths.clone());
+    }
+    registry
 }

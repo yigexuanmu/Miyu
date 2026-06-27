@@ -98,12 +98,12 @@ impl StateStore {
         max_chars: usize,
         trim_at_ratio: f32,
         trim_batch_ratio: f32,
-    ) -> Result<()> {
+    ) -> Result<Vec<StoredConversationEntry>> {
         let entries = self.load_conversation()?;
         let trigger = (max_chars as f32 * trim_at_ratio).max(1.0) as usize;
         let mut total = conversation_chars(&entries);
         if total <= trigger {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let target =
             max_chars.saturating_sub((max_chars as f32 * trim_batch_ratio).max(1.0) as usize);
@@ -112,13 +112,36 @@ impl StateStore {
             total = total.saturating_sub(entry_chars(&entries[start]));
             start += 1;
         }
-        self.rewrite_conversation(&entries[start..])
+        let evicted = entries[..start].to_vec();
+        self.rewrite_conversation(&entries[start..])?;
+        Ok(evicted)
     }
 
     pub fn reset_conversation(&self) -> Result<()> {
         self.init_files()?;
         std::fs::write(self.conversation_file(), "")?;
         Ok(())
+    }
+
+    pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
+        let mut entries = self.load_conversation()?;
+        let original_len = entries.len();
+        let mut prompt = None;
+        while matches!(entries.last(), Some(entry) if entry.role != "assistant") {
+            entries.pop();
+        }
+        if matches!(entries.last(), Some(entry) if entry.role == "assistant") {
+            entries.pop();
+        }
+        if matches!(entries.last(), Some(entry) if entry.role == "user") {
+            prompt = entries.last().map(|entry| entry.content.clone());
+            entries.pop();
+        }
+        let removed = original_len.saturating_sub(entries.len());
+        if removed > 0 {
+            self.rewrite_conversation(&entries)?;
+        }
+        Ok((removed, prompt))
     }
 
     pub fn add_usage(&self, usage: &Usage) -> Result<()> {

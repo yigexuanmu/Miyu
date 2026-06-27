@@ -1,8 +1,11 @@
+use crate::i18n::text as t;
 use crate::llm::{ChatResult, ChatStreamChunk, ChatStreamKind};
 use anyhow::Result;
 use crossterm::cursor::{Hide, MoveToColumn, Show};
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, terminal};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 
@@ -96,6 +99,7 @@ impl StreamRenderer {
 
     pub fn write_chunk(&mut self, chunk: ChatStreamChunk) -> Result<()> {
         self.hide_cursor()?;
+        let text = normalize_stream_text(&chunk.text);
         if self.plain && chunk.kind == ChatStreamKind::Reasoning {
             return Ok(());
         }
@@ -108,8 +112,8 @@ impl StreamRenderer {
             && chunk.kind == ChatStreamKind::Reasoning
         {
             self.finalize_tools_summary()?;
-            self.reasoning_chars += chunk.text.chars().count();
-            self.reasoning_lines += chunk.text.matches('\n').count();
+            self.reasoning_chars += text.chars().count();
+            self.reasoning_lines += text.matches('\n').count();
             self.mode = Some(ChatStreamKind::Reasoning);
             self.render_summary_line(&self.reasoning_summary_text())?;
             return Ok(());
@@ -123,9 +127,9 @@ impl StreamRenderer {
         }
         let mut stdout = io::stdout();
         if self.plain || chunk.kind == ChatStreamKind::Reasoning {
-            write!(stdout, "{}", chunk.text)?;
+            write!(stdout, "{text}")?;
         } else {
-            write!(stdout, "{}", self.markdown.push(&chunk.text))?;
+            write!(stdout, "{}", self.markdown.push(&text))?;
         }
         stdout.flush()?;
         Ok(())
@@ -137,10 +141,19 @@ impl StreamRenderer {
         }
         self.end_active_stream_line()?;
         self.finalize_reasoning_summary()?;
+        if name == "run_command" {
+            let mut stdout = io::stdout();
+            write_command_block(&mut stdout, arguments)?;
+            stdout.flush()?;
+            if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                self.tool_stats.entry(name.to_string()).or_default().calls += 1;
+            }
+            return Ok(());
+        }
         if self.tool_call_mode == ToolCallDisplayMode::Full {
             let mut stdout = io::stdout();
             writeln!(stdout, "tool {name}")?;
-            write_tool_payload(&mut stdout, "args", arguments)?;
+            write_tool_payload(&mut stdout, t("args", "参数"), arguments)?;
             stdout.flush()?;
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
             self.tool_stats.entry(name.to_string()).or_default().calls += 1;
@@ -153,11 +166,35 @@ impl StreamRenderer {
         if self.plain {
             return Ok(());
         }
-        let status = if ok { "ok" } else { "error" };
+        let status = if ok {
+            t("ok", "成功")
+        } else {
+            t("error", "错误")
+        };
+        if name == "run_command" {
+            if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                let stats = self.tool_stats.entry(name.to_string()).or_default();
+                if ok {
+                    stats.ok += 1;
+                } else {
+                    stats.error += 1;
+                    let mut stdout = io::stdout();
+                    write_command_error_block(&mut stdout, output)?;
+                    stdout.flush()?;
+                }
+                return Ok(());
+            }
+            if self.tool_call_mode == ToolCallDisplayMode::Full {
+                let mut stdout = io::stdout();
+                write_command_result_blocks(&mut stdout, output)?;
+                stdout.flush()?;
+                return Ok(());
+            }
+        }
         if self.tool_call_mode == ToolCallDisplayMode::Full {
             let mut stdout = io::stdout();
             writeln!(stdout, "result {name} {status}")?;
-            write_tool_payload(&mut stdout, "output", output)?;
+            write_tool_payload(&mut stdout, t("output", "输出"), output)?;
             stdout.flush()?;
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
             let stats = self.tool_stats.entry(name.to_string()).or_default();
@@ -172,6 +209,10 @@ impl StreamRenderer {
     }
 
     pub fn finish(&mut self) -> Result<()> {
+        if self.summary_line_active {
+            execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            self.summary_line_active = false;
+        }
         if self.mode == Some(ChatStreamKind::Content) && !self.plain {
             let mut stdout = io::stdout();
             write!(stdout, "{}", self.markdown.flush())?;
@@ -198,7 +239,7 @@ impl StreamRenderer {
                     writeln!(stdout)?;
                 }
                 execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-                writeln!(stdout, "thinking")?;
+                writeln!(stdout, "{}", t("thinking", "思考"))?;
             }
             ChatStreamKind::Content => {
                 if self.mode == Some(ChatStreamKind::Reasoning) {
@@ -236,7 +277,10 @@ impl StreamRenderer {
     fn finalize_reasoning_summary(&mut self) -> Result<()> {
         if self.reasoning_mode == ReasoningDisplayMode::Summary && self.reasoning_chars > 0 {
             if self.summary_line_active {
-                println!();
+                let mut stdout = io::stdout();
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                writeln!(stdout, "\x1b[2m{}\x1b[0m", self.reasoning_summary_text())?;
+                stdout.flush()?;
                 self.summary_line_active = false;
             } else {
                 println!("\x1b[2m{}\x1b[0m", self.reasoning_summary_text());
@@ -251,7 +295,10 @@ impl StreamRenderer {
     fn finalize_tools_summary(&mut self) -> Result<()> {
         if self.tool_call_mode == ToolCallDisplayMode::Summary && !self.tool_stats.is_empty() {
             if self.summary_line_active {
-                println!();
+                let mut stdout = io::stdout();
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                writeln!(stdout, "\x1b[2m{}\x1b[0m", self.tool_summary_text())?;
+                stdout.flush()?;
                 self.summary_line_active = false;
             } else {
                 println!("\x1b[2m{}\x1b[0m", self.tool_summary_text());
@@ -275,9 +322,12 @@ impl StreamRenderer {
 
     fn reasoning_summary_text(&self) -> String {
         format!(
-            "thinking · {} lines · {} chars",
+            "{} · {} {} · {} {}",
+            t("thinking", "思考"),
             self.reasoning_lines.max(1),
-            self.reasoning_chars
+            t("lines", "行"),
+            self.reasoning_chars,
+            t("chars", "字符")
         )
     }
 
@@ -287,15 +337,17 @@ impl StreamRenderer {
             .iter()
             .map(|(name, stats)| {
                 format!(
-                    "{name}×{} ok:{} err:{}",
+                    "{name}×{} {}:{} {}:{}",
                     stats.calls.max(stats.ok + stats.error),
+                    t("ok", "成功"),
                     stats.ok,
+                    t("err", "错误"),
                     stats.error
                 )
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("tools: {parts}")
+        format!("{}: {parts}", t("tools", "工具"))
     }
 
     fn hide_cursor(&mut self) -> Result<()> {
@@ -359,6 +411,7 @@ impl MarkdownStreamRenderer {
 
 struct MarkdownLineRenderer {
     in_code_block: bool,
+    in_math_block: bool,
     code_lang: String,
     table_buffer: Vec<String>,
 }
@@ -367,6 +420,7 @@ impl MarkdownLineRenderer {
     fn new() -> Self {
         Self {
             in_code_block: false,
+            in_math_block: false,
             code_lang: String::new(),
             table_buffer: Vec::new(),
         }
@@ -398,7 +452,15 @@ impl MarkdownLineRenderer {
         if self.in_code_block {
             return format!("{}\n", highlight_code_line(&self.code_lang, line));
         }
-        if line.contains('|') {
+        if line.trim() == "$$" {
+            let pending = self.flush();
+            self.in_math_block = !self.in_math_block;
+            return format!("{pending}\x1b[36m$$\x1b[0m\n");
+        }
+        if self.in_math_block {
+            return format!("\x1b[36m{}\x1b[0m\n", line.trim_end());
+        }
+        if looks_like_table_row(line) {
             self.table_buffer.push(line.to_string());
             return String::new();
         }
@@ -433,11 +495,8 @@ fn render_markdown_line(line: &str) -> String {
         return header;
     }
     if let Some((depth, rest)) = parse_blockquote(trimmed) {
-        let bars = "\x1b[36m|\x1b[0m ".repeat(depth);
-        return format!(
-            "{indent}{bars}\x1b[3m\x1b[36m{}\x1b[0m",
-            render_inline(rest)
-        );
+        let bars = "\x1b[90m|\x1b[0m ".repeat(depth);
+        return format!("{indent}{bars}\x1b[90m{}\x1b[0m", render_inline(rest));
     }
     if let Some(rest) = trimmed
         .strip_prefix("- ")
@@ -476,8 +535,16 @@ fn render_header(line: &str) -> Option<String> {
     if level == 0 || level > 6 || line.as_bytes().get(level) != Some(&b' ') {
         return None;
     }
+    let prefix = match level {
+        1 => "·",
+        2 => "··",
+        3 => "···",
+        4 => "····",
+        5 => "·····",
+        _ => "······",
+    };
     Some(format!(
-        "\x1b[1m\x1b[36m{}\x1b[0m",
+        "\x1b[1m\x1b[36m{prefix} {}\x1b[0m",
         render_inline(&line[level + 1..])
     ))
 }
@@ -513,6 +580,24 @@ fn render_inline(text: &str) -> String {
                 output.push_str("\x1b[33m");
                 output.extend(chars[index + 1..end].iter());
                 output.push_str("\x1b[0m");
+                index = end + 1;
+                continue;
+            }
+        }
+        if index + 1 < chars.len() && chars[index] == '$' && chars[index + 1] == '$' {
+            if let Some(end) = find_double_marker(&chars, index + 2, '$') {
+                output.push_str("\x1b[36m$$ ");
+                output.extend(chars[index + 2..end].iter());
+                output.push_str(" $$\x1b[0m");
+                index = end + 2;
+                continue;
+            }
+        }
+        if chars[index] == '$' {
+            if let Some(end) = find_marker(&chars, index + 1, '$') {
+                output.push_str("\x1b[36m$");
+                output.extend(chars[index + 1..end].iter());
+                output.push_str("$\x1b[0m");
                 index = end + 1;
                 continue;
             }
@@ -617,10 +702,10 @@ fn render_html_tag(tag: &str) -> Option<String> {
 
 fn horizontal_rule() -> String {
     let width = terminal::size()
-        .map(|(width, _)| usize::from(width))
-        .unwrap_or(48)
-        .clamp(16, 120);
-    format!("\x1b[2m{}\x1b[0m", "-".repeat(width))
+        .map(|(width, _)| usize::from(width) / 3)
+        .unwrap_or(24)
+        .clamp(16, 40);
+    format!("\x1b[2m{}\x1b[0m", "─".repeat(width))
 }
 
 fn render_table(lines: &[String]) -> String {
@@ -772,6 +857,11 @@ fn is_table_separator(line: &str) -> bool {
         && trimmed.contains('-')
 }
 
+fn looks_like_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
+}
+
 fn is_horizontal_rule(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.len() >= 3 && trimmed.chars().all(|ch| ch == '-')
@@ -838,6 +928,103 @@ fn write_tool_payload(stdout: &mut io::Stdout, label: &str, payload: &str) -> Re
     Ok(())
 }
 
+fn write_command_block(stdout: &mut io::Stdout, arguments: &str) -> Result<()> {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let command = parsed
+        .as_ref()
+        .and_then(|value| value.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or(arguments)
+        .trim();
+    writeln!(stdout, "\x1b[2m,-- {}\x1b[0m", t("command", "命令"))?;
+    writeln!(stdout, "\x1b[33m$ {command}\x1b[0m")?;
+    writeln!(stdout, "\x1b[2m`--\x1b[0m")?;
+    Ok(())
+}
+
+fn write_command_result_blocks(stdout: &mut io::Stdout, output: &str) -> Result<()> {
+    let Some(result) = parse_command_result(output) else {
+        return write_tool_payload(stdout, t("output", "输出"), output);
+    };
+    if !result.stdout.trim().is_empty() {
+        write_fenced_block(stdout, t("output", "输出"), &result.stdout)?;
+    }
+    if !result.stderr.trim().is_empty() {
+        let label = result
+            .exit_code
+            .map(|code| format!("{} exit {code}", t("error", "错误")))
+            .unwrap_or_else(|| t("error", "错误").to_string());
+        write_fenced_block(stdout, &label, &result.stderr)?;
+    } else if !result.success {
+        let label = result
+            .exit_code
+            .map(|code| format!("{} exit {code}", t("error", "错误")))
+            .unwrap_or_else(|| t("error", "错误").to_string());
+        write_fenced_block(
+            stdout,
+            &label,
+            t(
+                "command failed without stderr",
+                "命令失败，但没有 stderr 输出",
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_command_error_block(stdout: &mut io::Stdout, output: &str) -> Result<()> {
+    let Some(result) = parse_command_result(output) else {
+        return write_fenced_block(stdout, t("error", "错误"), output);
+    };
+    if result.success {
+        return Ok(());
+    }
+    let label = result
+        .exit_code
+        .map(|code| format!("{} exit {code}", t("error", "错误")))
+        .unwrap_or_else(|| t("error", "错误").to_string());
+    let message = if result.stderr.trim().is_empty() {
+        result.stdout.as_str()
+    } else {
+        result.stderr.as_str()
+    };
+    write_fenced_block(stdout, &label, message)
+}
+
+fn write_fenced_block(stdout: &mut io::Stdout, label: &str, text: &str) -> Result<()> {
+    writeln!(stdout, "\x1b[2m,-- {label}\x1b[0m")?;
+    for line in truncate_chars(text.trim(), 2400).lines() {
+        writeln!(stdout, "\x1b[33m{line}\x1b[0m")?;
+    }
+    writeln!(stdout, "\x1b[2m`--\x1b[0m")?;
+    Ok(())
+}
+
+struct CommandResult {
+    success: bool,
+    exit_code: Option<i64>,
+    stdout: String,
+    stderr: String,
+}
+
+fn parse_command_result(output: &str) -> Option<CommandResult> {
+    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    Some(CommandResult {
+        success: value.get("success")?.as_bool()?,
+        exit_code: value.get("exit_code").and_then(Value::as_i64),
+        stdout: value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        stderr: value
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
 fn format_tool_payload(payload: &str) -> String {
     let text = payload.trim();
     let formatted = serde_json::from_str::<serde_json::Value>(text)
@@ -854,22 +1041,33 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
     let omitted = total - max_chars;
     format!(
-        "{}\n... truncated {omitted} chars ...",
-        text.chars().take(max_chars).collect::<String>()
+        "{}\n... {} {omitted} {} ...",
+        text.chars().take(max_chars).collect::<String>(),
+        t("truncated", "已截断"),
+        t("chars", "字符")
     )
 }
 
 impl Drop for StreamRenderer {
     fn drop(&mut self) {
+        if self.summary_line_active {
+            let _ = execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::CurrentLine));
+            eprintln!();
+            self.summary_line_active = false;
+        }
         let _ = self.show_cursor();
         let _ = execute!(io::stdout(), ResetColor);
     }
 }
 
+fn normalize_stream_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn print_reasoning(reasoning: &str) -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-    writeln!(stdout, "thinking")?;
+    writeln!(stdout, "{}", t("thinking", "思考"))?;
     for line in reasoning.trim().lines() {
         writeln!(stdout, "  {line}")?;
     }
@@ -895,7 +1093,24 @@ mod tests {
     fn flushes_partial_final_line() {
         let mut renderer = MarkdownStreamRenderer::new();
         assert_eq!(renderer.push("# Title"), "");
-        assert_eq!(renderer.flush(), "\x1b[1m\x1b[36mTitle\x1b[0m\n");
+        assert_eq!(renderer.flush(), "\x1b[1m\x1b[36m· Title\x1b[0m\n");
+    }
+
+    #[test]
+    fn headings_use_one_color_and_distinct_prefix_lengths() {
+        assert_eq!(render_markdown_line("# One"), "\x1b[1m\x1b[36m· One\x1b[0m");
+        assert_eq!(
+            render_markdown_line("## Two"),
+            "\x1b[1m\x1b[36m·· Two\x1b[0m"
+        );
+        assert_eq!(
+            render_markdown_line("### Three"),
+            "\x1b[1m\x1b[36m··· Three\x1b[0m"
+        );
+        assert_eq!(
+            render_markdown_line("###### Six"),
+            "\x1b[1m\x1b[36m······ Six\x1b[0m"
+        );
     }
 
     #[test]
@@ -912,8 +1127,8 @@ mod tests {
     fn blockquote_is_visually_distinct() {
         let mut renderer = MarkdownStreamRenderer::new();
         let output = renderer.push(">> quoted\n");
-        assert!(output.contains("\x1b[36m|\x1b[0m \x1b[36m|\x1b[0m"));
-        assert!(output.contains("\x1b[3m\x1b[36mquoted\x1b[0m"));
+        assert!(output.contains("\x1b[90m|\x1b[0m \x1b[90m|\x1b[0m"));
+        assert!(output.contains("\x1b[90mquoted\x1b[0m"));
     }
 
     #[test]
@@ -956,6 +1171,21 @@ mod tests {
     }
 
     #[test]
+    fn renders_math_formulas_visibly() {
+        let output = render_inline("inline $E=mc^2$ and display $$a^2+b^2=c^2$$");
+        assert!(output.contains("\x1b[36m$E=mc^2$\x1b[0m"));
+        assert!(output.contains("\x1b[36m$$ a^2+b^2=c^2 $$\x1b[0m"));
+    }
+
+    #[test]
+    fn renders_multiline_math_blocks_visibly() {
+        let mut renderer = MarkdownStreamRenderer::new();
+        let output = renderer.push("$$\na^2 + b^2 = c^2\n$$\n");
+        assert!(output.contains("\x1b[36m$$\x1b[0m"));
+        assert!(output.contains("\x1b[36ma^2 + b^2 = c^2\x1b[0m"));
+    }
+
+    #[test]
     fn renders_selected_inline_html_tags() {
         let output = render_inline("<u>under</u> H<sub>2</sub> x<sup>2</sup><br>next");
         assert!(output.contains("\x1b[4munder\x1b[0m"));
@@ -983,5 +1213,24 @@ mod tests {
         assert!(output.contains("+"));
         assert!(!output.contains(":---"));
         assert!(output.contains("\x1b[1mleft\x1b[0m"));
+    }
+
+    #[test]
+    fn does_not_buffer_plain_lines_with_pipes_as_tables() {
+        let mut renderer = MarkdownStreamRenderer::new();
+        let output = renderer.push("echo hi | wc -l\nnext\n");
+        assert!(output.contains("echo hi | wc -l\nnext\n"));
+    }
+
+    #[test]
+    fn parses_command_result_json() {
+        let result = parse_command_result(
+            r#"{"success":false,"exit_code":1,"stdout":"unused","stderr":"not found"}"#,
+        )
+        .unwrap();
+        assert!(!result.success);
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stdout, "unused");
+        assert_eq!(result.stderr, "not found");
     }
 }

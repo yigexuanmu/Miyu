@@ -3,6 +3,7 @@ use super::{
     ToolDefinition, Usage,
 };
 use crate::config::{AppConfig, ProviderConfig};
+use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
@@ -24,6 +25,16 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn new(provider: &ProviderConfig, _config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
+        if provider.default_model.trim().is_empty() {
+            bail!(
+                "{}: {}",
+                t(
+                    "provider has no active model; select a model before chatting",
+                    "provider 没有当前模型；请先选择模型再聊天",
+                ),
+                provider.id
+            );
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(provider.timeout_seconds))
             .build()?;
@@ -65,7 +76,10 @@ impl OpenAiCompatibleClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("chat completions stream request failed ({status}): {body}");
+            bail!(
+                "{} ({status}): {body}",
+                t("chat completions stream request failed", "聊天流式请求失败",)
+            );
         }
 
         let mut buffer = String::new();
@@ -305,7 +319,11 @@ where
     }
     let response: ChatStreamResponse = serde_json::from_str(data).with_context(|| {
         format!(
-            "invalid chat completions stream response: {}",
+            "{}: {}",
+            t(
+                "invalid chat completions stream response",
+                "无效的聊天流式响应",
+            ),
             clean_plain_text(data.to_string())
         )
     })?;
@@ -448,7 +466,13 @@ fn finalize_stream_result(
         dsml_tool_calls
     };
     if content.trim().is_empty() && tool_calls.is_empty() {
-        bail!("chat completions stream response was empty");
+        bail!(
+            "{}",
+            t(
+                "chat completions stream response was empty",
+                "聊天流式响应为空",
+            )
+        );
     }
     Ok(ChatResult {
         content,
@@ -607,11 +631,15 @@ fn clean_plain_text(mut text: String) -> String {
 fn strip_tagged_sections(mut text: String, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
+    let open_prefix = format!("<{tag}");
     loop {
-        let Some(start) = text.find(&open) else {
+        let Some(start) = text.find(&open_prefix) else {
             break;
         };
-        let content_start = start + open.len();
+        let content_start = text[start..]
+            .find('>')
+            .map(|offset| start + offset + 1)
+            .unwrap_or(start + open.len());
         let Some(relative_end) = text[content_start..].find(&close) else {
             text.replace_range(start.., "");
             break;

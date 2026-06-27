@@ -14,6 +14,31 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
+    register_readonly(registry, config.clone(), paths.clone());
+    if config.plugins.knowledge_base.upload_tool_enabled {
+        registry.register(ToolSpec::new(
+            "upload_text_to_knowledge_base",
+            "Upload text into the local knowledge base. Only use when the user explicitly asks to save/upload specified content into the knowledge base. Never use this for skills, memory, persona, identity, or configuration.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Text content to save." },
+                    "title": { "type": "string", "description": "Optional title used for markdown heading and default file name." },
+                    "file_name": { "type": "string", "description": "Optional knowledge base relative path." }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            move |args| {
+                let config = config.clone();
+                let paths = paths.clone();
+                async move { tool_upload(args, config, paths).await }
+            },
+        ));
+    }
+}
+
+pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
     registry.register(ToolSpec::new(
         "search_knowledge_base",
         "Search the local knowledge base content. Returns file paths and original text snippets. Use read_knowledge_base_file if snippets are insufficient. Mention paths only when useful or when the user asks.",
@@ -81,27 +106,6 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
             }
         },
     ));
-    if config.plugins.knowledge_base.upload_tool_enabled {
-        registry.register(ToolSpec::new(
-            "upload_text_to_knowledge_base",
-            "Upload text into the local knowledge base. Only use when the user explicitly asks to save/upload specified content. In the final answer, briefly confirm and include the saved path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "Text content to save." },
-                    "title": { "type": "string", "description": "Optional title used for markdown heading and default file name." },
-                    "file_name": { "type": "string", "description": "Optional knowledge base relative path." }
-                },
-                "required": ["content"],
-                "additionalProperties": false
-            }),
-            move |args| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move { tool_upload(args, config, paths).await }
-            },
-        ));
-    }
 }
 
 pub struct KnowledgeBase {
@@ -770,6 +774,7 @@ async fn tool_upload(args: Value, config: AppConfig, paths: MiyuPaths) -> Result
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
+    reject_non_kb_upload(content, title, file_name)?;
     let rel = if file_name.is_empty() {
         format!(
             "chat_uploads/{}/{}.md",
@@ -803,6 +808,18 @@ async fn tool_upload(args: Value, config: AppConfig, paths: MiyuPaths) -> Result
         "path": saved,
     })
     .to_string())
+}
+
+fn reject_non_kb_upload(content: &str, title: &str, file_name: &str) -> Result<()> {
+    let text = format!("{content}\n{title}\n{file_name}").to_ascii_lowercase();
+    let forbidden = [
+        "skill", "skills/", "skll", "记忆", "memory", "persona", "identity", "prompt", "配置",
+        "config",
+    ];
+    if forbidden.iter().any(|needle| text.contains(needle)) {
+        bail!("this content looks like a skill, memory, prompt, identity, or config request; do not upload it to the knowledge base")
+    }
+    Ok(())
 }
 
 pub async fn embed_text(

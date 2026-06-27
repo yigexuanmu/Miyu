@@ -1,4 +1,6 @@
+pub mod bash;
 pub mod fish;
+pub mod zsh;
 
 pub fn looks_like_natural_language(input: &str) -> bool {
     let trimmed = input.trim();

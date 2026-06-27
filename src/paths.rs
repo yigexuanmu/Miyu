@@ -1,3 +1,4 @@
+use crate::i18n::text as t;
 use anyhow::{Context, Result};
 use directories::{BaseDirs, UserDirs};
 use std::path::PathBuf;
@@ -13,11 +14,16 @@ pub struct MiyuPaths {
     pub state_dir: PathBuf,
     pub pictures_dir: PathBuf,
     pub fish_hook_file: PathBuf,
+    pub bash_hook_file: PathBuf,
+    pub zsh_hook_file: PathBuf,
 }
 
 impl MiyuPaths {
     pub fn new() -> Result<Self> {
-        let base = BaseDirs::new().context("could not determine XDG base directories")?;
+        let base = BaseDirs::new().context(t(
+            "could not determine XDG base directories",
+            "无法确定 XDG 基础目录",
+        ))?;
         let config_dir = base.config_dir().join("miyu");
         let data_dir = base.data_dir().join("miyu");
         let cache_dir = base.cache_dir().join("miyu");
@@ -31,6 +37,8 @@ impl MiyuPaths {
             .unwrap_or_else(|| base.home_dir().join("Pictures"))
             .join("miyu");
         let fish_hook_file = base.config_dir().join("fish/conf.d/miyu.fish");
+        let bash_hook_file = config_dir.join("shell/bash-hook.sh");
+        let zsh_hook_file = config_dir.join("shell/zsh-hook.zsh");
 
         Ok(Self {
             config_file: config_dir.join("config.jsonc"),
@@ -42,6 +50,8 @@ impl MiyuPaths {
             state_dir,
             pictures_dir,
             fish_hook_file,
+            bash_hook_file,
+            zsh_hook_file,
         })
     }
 
@@ -56,14 +66,56 @@ impl MiyuPaths {
     }
 
     pub fn print(&self) {
-        println!("config_dir: {}", self.config_dir.display());
-        println!("config_file: {}", self.config_file.display());
-        println!("secrets_file: {}", self.secrets_file.display());
-        println!("skills_dir: {}", self.skills_dir.display());
-        println!("data_dir: {}", self.data_dir.display());
-        println!("cache_dir: {}", self.cache_dir.display());
-        println!("state_dir: {}", self.state_dir.display());
-        println!("pictures_dir: {}", self.pictures_dir.display());
-        println!("fish_hook_file: {}", self.fish_hook_file.display());
+        println!(
+            "{}: {}",
+            t("config_dir", "配置目录"),
+            self.config_dir.display()
+        );
+        println!(
+            "{}: {}",
+            t("config_file", "配置文件"),
+            self.config_file.display()
+        );
+        println!(
+            "{}: {}",
+            t("secrets_file", "密钥文件"),
+            self.secrets_file.display()
+        );
+        println!(
+            "{}: {}",
+            t("skills_dir", "skills 目录"),
+            self.skills_dir.display()
+        );
+        println!("{}: {}", t("data_dir", "数据目录"), self.data_dir.display());
+        println!(
+            "{}: {}",
+            t("cache_dir", "缓存目录"),
+            self.cache_dir.display()
+        );
+        println!(
+            "{}: {}",
+            t("state_dir", "状态目录"),
+            self.state_dir.display()
+        );
+        println!(
+            "{}: {}",
+            t("pictures_dir", "图片目录"),
+            self.pictures_dir.display()
+        );
+        println!(
+            "{}: {}",
+            t("fish_hook_file", "fish hook 文件"),
+            self.fish_hook_file.display()
+        );
+        println!(
+            "{}: {}",
+            t("bash_hook_file", "bash hook 文件"),
+            self.bash_hook_file.display()
+        );
+        println!(
+            "{}: {}",
+            t("zsh_hook_file", "zsh hook 文件"),
+            self.zsh_hook_file.display()
+        );
     }
 }

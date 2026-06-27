@@ -1,10 +1,13 @@
 use super::{ToolRegistry, ToolSpec};
 use crate::config::{AppConfig, PrintImagePluginConfig, ProviderConfig, VisionPluginConfig};
+use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
+use crate::i18n::text as t;
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -22,12 +25,12 @@ pub fn register(
     }
     registry.register(ToolSpec::new(
         "vision_analyze",
-        "Analyze an image using the current multimodal model or a configured vision provider. Supports local image paths and http(s) image URLs.",
+        t("Analyze an image using the current multimodal model or a configured vision provider. Supports local image paths and http(s) image URLs.", "使用当前多模态模型或配置的视觉 provider 分析图片。支持本地图片路径和 http(s) 图片 URL。"),
         json!({
             "type": "object",
             "properties": {
-                "image": { "type": "string", "description": "Local image path or http(s) image URL." },
-                "prompt": { "type": "string", "description": "Question or instruction for image analysis. Defaults to a concise description." }
+                "image": { "type": "string", "description": t("Local image path or http(s) image URL.", "本地图片路径或 http(s) 图片 URL。") },
+                "prompt": { "type": "string", "description": t("Question or instruction for image analysis. Defaults to a concise description.", "图片分析问题或指令。默认简洁描述图片。") }
             },
             "required": ["image"],
             "additionalProperties": false
@@ -46,14 +49,14 @@ pub fn register_print(registry: &mut ToolRegistry, config: AppConfig) {
     }
     registry.register(ToolSpec::new(
         "print_image",
-        "Print/render a local image directly in the current terminal output using chafa. Use this when the user asks to show, print, render, or preview an image, or when you need to inspect an image visually in the terminal before answering.",
+        t("Print/render a local image directly in the current terminal output using chafa. Use this when the user asks to show, print, render, or preview an image, or when you need to inspect an image visually in the terminal before answering.", "使用 chafa 在当前终端输出中直接打印/渲染本地图片。当用户要求显示、打印、渲染、预览图片，或回答前需要在终端中目视检查图片时使用。"),
         json!({
             "type": "object",
             "properties": {
-                "image": { "type": "string", "description": "Local image path." },
-                "size": { "type": "string", "description": "Optional chafa size, e.g. 80x40. Use this or width/height to avoid oversized output." },
-                "width": { "type": "integer", "description": "Optional output width in terminal cells, e.g. 80." },
-                "height": { "type": "integer", "description": "Optional output height in terminal cells, e.g. 40." }
+                "image": { "type": "string", "description": t("Local image path.", "本地图片路径。") },
+                "size": { "type": "string", "description": t("Optional chafa size, e.g. 80x40. Use this or width/height to avoid oversized output.", "可选 chafa 尺寸，例如 80x40。用它或 width/height 避免输出过大。") },
+                "width": { "type": "integer", "description": t("Optional output width in terminal cells, e.g. 80.", "可选终端单元格输出宽度，例如 80。") },
+                "height": { "type": "integer", "description": t("Optional output height in terminal cells, e.g. 40.", "可选终端单元格输出高度，例如 40。") }
             },
             "required": ["image"],
             "additionalProperties": false
@@ -72,19 +75,34 @@ async fn print_image(args: Value, print_config: &PrintImagePluginConfig) -> Resu
         .unwrap_or_default()
         .trim();
     if image.is_empty() {
-        bail!("image is required")
+        bail!("{}", t("image is required", "缺少图片路径"))
     }
     let path = expand_path(image);
-    let metadata = std::fs::metadata(&path)
-        .with_context(|| format!("failed to stat image {}", path.display()))?;
+    let metadata = std::fs::metadata(&path).with_context(|| {
+        format!(
+            "{} {}",
+            t("failed to stat image", "无法读取图片元数据"),
+            path.display()
+        )
+    })?;
     if !metadata.is_file() {
-        bail!("image path is not a file: {}", path.display())
+        bail!(
+            "{}: {}",
+            t("image path is not a file", "图片路径不是文件"),
+            path.display()
+        )
     }
     print_image_file(&path, print_size(&args, print_config)).await?;
-    Ok(format!("printed image in terminal: {}", path.display()))
+    Ok(format!(
+        "{}: {}",
+        t("printed image in terminal", "已在终端打印图片"),
+        path.display()
+    ))
 }
 
 pub async fn print_image_file(path: &Path, size: Option<String>) -> Result<()> {
+    println!();
+    io::stdout().flush()?;
     let mut command = Command::new("chafa");
     if let Some(size) = size {
         command.arg("--size").arg(size);
@@ -100,6 +118,8 @@ pub async fn print_image_file(path: &Path, size: Option<String>) -> Result<()> {
     if !status.success() {
         bail!("chafa exited with status {status}")
     }
+    println!();
+    io::stdout().flush()?;
     Ok(())
 }
 
@@ -180,15 +200,26 @@ async fn analyze_image(args: Value, config: AppConfig, paths: MiyuPaths) -> Resu
 }
 
 fn vision_provider(config: &AppConfig, vision: &VisionPluginConfig) -> Result<ProviderConfig> {
-    let mut provider = if !vision.vision_provider_id.trim().is_empty() {
-        config
-            .provider(Some(vision.vision_provider_id.trim()))?
-            .clone()
+    let provider_id = vision.vision_provider_id.trim();
+    let model = vision.vision_model.trim();
+    let mut provider = if !provider_id.is_empty() {
+        config.provider(Some(provider_id))?.clone()
     } else {
-        config.provider(None)?.clone()
+        config.provider(Some(OPENCODE_PROVIDER_ID))?.clone()
     };
-    if !vision.vision_model.trim().is_empty() {
-        provider.default_model = vision.vision_model.trim().to_string();
+    provider.default_model = if !model.is_empty() {
+        model.to_string()
+    } else if provider_id.is_empty() {
+        OPENCODE_DEFAULT_VISION_MODEL.to_string()
+    } else {
+        provider.default_model.clone()
+    };
+    if !provider
+        .models
+        .iter()
+        .any(|item| item == &provider.default_model)
+    {
+        provider.models.push(provider.default_model.clone());
     }
     Ok(provider)
 }

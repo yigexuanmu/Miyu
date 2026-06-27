@@ -2,7 +2,10 @@ mod agent;
 mod cli;
 mod config;
 mod config_tui;
+mod default_models;
+mod i18n;
 mod llm;
+mod memory;
 mod paths;
 mod prompts;
 mod render;
@@ -11,10 +14,9 @@ mod state;
 mod tools;
 
 use anyhow::Result;
-use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = cli::Cli::parse();
+    let cli = cli::parse();
     cli::run(cli).await
 }
