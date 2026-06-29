@@ -40,6 +40,10 @@ pub fn ensure_initialized(paths: &MiyuPaths, config: &AppConfig) -> Result<()> {
     import_snapshot(paths, config, &source, &release_hash)
 }
 
+pub fn bundled_available() -> bool {
+    default_kb_source_dir().is_dir()
+}
+
 pub fn status(paths: &MiyuPaths) -> Result<DefaultKbStatus> {
     let state = load_state(paths)?;
     Ok(DefaultKbStatus {

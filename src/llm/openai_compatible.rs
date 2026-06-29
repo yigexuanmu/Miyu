@@ -1318,17 +1318,13 @@ where
         | "response.reasoning_summary.delta"
         | "response.reasoning_summary_text.delta" => {
             if let Some(text) = event.delta {
-                if *content_started {
-                    reasoning.push_str(&clean_plain_text(text));
-                } else {
-                    push_buffered_chunk(
-                        reasoning,
-                        reasoning_emitted,
-                        ChatStreamKind::Reasoning,
-                        text,
-                        on_chunk,
-                    )?;
-                }
+                push_buffered_chunk(
+                    reasoning,
+                    reasoning_emitted,
+                    ChatStreamKind::Reasoning,
+                    text,
+                    on_chunk,
+                )?;
             }
         }
         "response.reasoning_text.done"
@@ -2060,13 +2056,15 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].kind, ChatStreamKind::Reasoning);
         assert_eq!(chunks[0].text, "思考");
         assert_eq!(chunks[1].kind, ChatStreamKind::Content);
         assert!(chunks[1].text.is_empty());
         assert_eq!(chunks[2].kind, ChatStreamKind::Content);
         assert_eq!(chunks[2].text, "答案");
+        assert_eq!(chunks[3].kind, ChatStreamKind::Reasoning);
+        assert_eq!(chunks[3].text, "晚到");
         assert_eq!(reasoning, "思考晚到");
     }
 

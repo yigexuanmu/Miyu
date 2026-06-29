@@ -674,7 +674,24 @@ fn run_init(paths: &MiyuPaths, kind: InitKind) -> Result<()> {
     )?;
     StateStore::new(paths)?.init_files()?;
     let config = AppConfig::load_or_default(paths)?;
-    crate::default_kb::ensure_initialized(paths, &config).ok();
+    if crate::default_kb::bundled_available() {
+        print_init_step(
+            interactive,
+            t("Importing default knowledge base", "正在导入默认知识库"),
+            &paths.data_dir.join("kb").display().to_string(),
+        )?;
+        if let Err(err) = crate::default_kb::ensure_initialized(paths, &config) {
+            if interactive {
+                eprintln!(
+                    "{}: {err}",
+                    t(
+                        "default knowledge base import skipped",
+                        "默认知识库导入已跳过"
+                    )
+                );
+            }
+        }
+    }
     print_init_step(
         interactive,
         t("Preparing data directory", "正在准备数据目录"),
@@ -1351,10 +1368,17 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
             false,
             config.display.readable_tool_names,
         );
-        let chat_result = agent
-            .chat_stream(input, |event| handle_agent_event(&mut renderer, event))
-            .await
-            .map(|_| ());
+        let chat_result = {
+            let chat = agent.chat_stream(input, |event| handle_agent_event(&mut renderer, event));
+            tokio::pin!(chat);
+            tokio::select! {
+                result = &mut chat => result.map(|_| ()),
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    Ok(())
+                }
+            }
+        };
         renderer.finish()?;
         chat_result?;
     }

@@ -39,6 +39,6 @@ syntect = { version = "5.2", default-features = false, features = ["default-synt
 termimad = "0.34"
 tempfile = "3.15"
 tar = "0.4"
-tokio = { version = "1.38", features = ["macros", "process", "rt-multi-thread"] }
+tokio = { version = "1.38", features = ["macros", "process", "rt-multi-thread", "signal"] }
 trash = "5.2"
 urlencoding = "2.1"
