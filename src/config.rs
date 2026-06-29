@@ -91,16 +91,28 @@ pub struct ProviderConfig {
     pub id: String,
     pub display_name: String,
     pub base_url: String,
+    #[serde(
+        default = "default_provider_protocol",
+        skip_serializing_if = "is_auto_protocol"
+    )]
+    pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_context_chars: HashMap<String, usize>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_model: String,
-    #[serde(default = "default_timeout")]
+    #[serde(
+        default = "default_timeout",
+        skip_serializing_if = "is_default_timeout"
+    )]
     pub timeout_seconds: u64,
-    #[serde(default = "default_temperature")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "is_default_temperature"
+    )]
     pub temperature: f32,
 }
 
@@ -457,7 +469,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             active_provider: OPENCODE_PROVIDER_ID.to_string(),
-            providers: vec![ProviderConfig::default_opencodezen()],
+            providers: ProviderConfig::default_templates(),
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
             skills: SkillsConfig::default(),
@@ -757,6 +769,7 @@ impl ProviderConfig {
             id: OPENCODE_PROVIDER_ID.to_string(),
             display_name: "opencode Zen".to_string(),
             base_url: OPENCODE_ZEN_BASE_URL.to_string(),
+            protocol: default_provider_protocol(),
             api_key: None,
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
             model_context_chars: HashMap::new(),
@@ -771,10 +784,49 @@ impl ProviderConfig {
             id: "openai".to_string(),
             display_name: "OpenAI-compatible".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
+            protocol: default_provider_protocol(),
             api_key: Some("$env:OPENAI_API_KEY".to_string()),
             models: vec!["gpt-4o-mini".to_string()],
             model_context_chars: HashMap::new(),
             default_model: "gpt-4o-mini".to_string(),
+            timeout_seconds: default_timeout(),
+            temperature: default_temperature(),
+        }
+    }
+
+    pub fn default_templates() -> Vec<Self> {
+        let mut providers = vec![Self::default_opencodezen()];
+        providers.extend([
+            Self::template("openai", "OpenAI", "https://api.openai.com/v1"),
+            Self::template("deepseek", "DeepSeek", "https://api.deepseek.com"),
+            Self::template(
+                "gemini",
+                "Gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+            Self::template(
+                "xiaomi",
+                "Xiaomi",
+                "https://token-plan-sgp.xiaomimimo.com/v1",
+            ),
+            Self::template("minimax", "Minimax", "https://api.minimaxi.com/v1"),
+            Self::template("openrouter", "OpenRouter", "https://openrouter.ai/api/v1"),
+            Self::template("ollama", "Ollama", "http://localhost:11434/v1"),
+            Self::template("lmstudio", "LMStudio", "http://localhost:1234/v1"),
+        ]);
+        providers
+    }
+
+    fn template(id: &str, display_name: &str, base_url: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            display_name: display_name.to_string(),
+            base_url: base_url.to_string(),
+            protocol: default_provider_protocol(),
+            api_key: None,
+            models: Vec::new(),
+            model_context_chars: HashMap::new(),
+            default_model: String::new(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
         }
@@ -893,12 +945,13 @@ impl AppConfig {
     }
 
     fn normalize_builtin_providers(&mut self) {
-        if !self
-            .providers
-            .iter()
-            .any(|provider| provider.id == OPENCODE_PROVIDER_ID || provider.is_opencode_zen())
-        {
-            self.providers.push(ProviderConfig::default_opencodezen());
+        for provider in ProviderConfig::default_templates() {
+            if !self.providers.iter().any(|item| {
+                item.id == provider.id
+                    || provider.id == OPENCODE_PROVIDER_ID && item.is_opencode_zen()
+            }) {
+                self.providers.push(provider);
+            }
         }
         if self.active_provider == "opencodezen" {
             self.active_provider = OPENCODE_PROVIDER_ID.to_string();
@@ -1271,6 +1324,22 @@ fn persona_scope_name(name: &str) -> String {
 
 fn default_temperature() -> f32 {
     0.7
+}
+
+fn is_default_timeout(value: &u64) -> bool {
+    *value == default_timeout()
+}
+
+fn is_default_temperature(value: &f32) -> bool {
+    (*value - default_temperature()).abs() < f32::EPSILON
+}
+
+fn default_provider_protocol() -> String {
+    "auto".to_string()
+}
+
+fn is_auto_protocol(value: &str) -> bool {
+    value.trim().is_empty() || value == "auto"
 }
 
 fn default_true() -> bool {

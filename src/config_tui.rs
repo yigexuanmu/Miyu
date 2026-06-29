@@ -1287,7 +1287,7 @@ impl<'a> ProviderBrowser<'a> {
                 self.raw_models = models;
             }
             Err(err) => {
-                self.status = format!("获取模型失败: {err}");
+                self.status = format_status_line(&format!("获取模型失败: {err}"));
                 self.raw_models.clear();
             }
         }
@@ -1521,11 +1521,13 @@ impl<'a> ProviderBrowser<'a> {
         queue!(
             stdout,
             MoveTo(0, rows.saturating_sub(2)),
+            Clear(ClearType::CurrentLine),
             Print(truncate(&status, cols as usize))
         )?;
         queue!(
             stdout,
             MoveTo(0, rows.saturating_sub(1)),
+            Clear(ClearType::CurrentLine),
             Print(truncate(&help, cols as usize))
         )?;
         stdout.flush()?;
@@ -1534,6 +1536,10 @@ impl<'a> ProviderBrowser<'a> {
 }
 
 type FetchResult = (u64, Result<Vec<String>, String>);
+
+fn format_status_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 #[derive(Clone)]
 struct ModelEntry {
@@ -1665,6 +1671,12 @@ fn edit_provider_form(
         Field::new("配置 ID", provider.id.clone()),
         Field::new("显示名称", provider.display_name.clone()),
         Field::new("Base URL", provider.base_url.clone()),
+        Field::new("协议", provider.protocol.clone()).choices(&[
+            "auto",
+            "openai-chat",
+            "openai-responses",
+            "anthropic",
+        ]),
         Field::new(
             "API Key 或 $env:NAME",
             provider.api_key.clone().unwrap_or_default(),
@@ -1677,9 +1689,9 @@ fn edit_provider_form(
     if !run_form(stdout, " EDIT PROVIDER ", &mut fields)? {
         return Ok(None);
     }
-    let default_model = fields[4].value.trim().to_string();
+    let default_model = fields[5].value.trim().to_string();
     let mut model_context_chars = provider.model_context_chars.clone();
-    match fields[5].value.trim().parse::<usize>().unwrap_or_default() {
+    match fields[6].value.trim().parse::<usize>().unwrap_or_default() {
         0 => {
             model_context_chars.remove(&default_model);
         }
@@ -1695,12 +1707,13 @@ fn edit_provider_form(
         id: fields[0].value.trim().to_string(),
         display_name: fields[1].value.trim().to_string(),
         base_url: normalize_base_url(&fields[2].value),
-        api_key: Some(fields[3].value.trim().to_string()).filter(|value| !value.is_empty()),
+        protocol: fields[3].value.trim().to_string(),
+        api_key: Some(fields[4].value.trim().to_string()).filter(|value| !value.is_empty()),
         models,
         model_context_chars,
         default_model,
-        timeout_seconds: fields[6].value.trim().parse().unwrap_or(60),
-        temperature: fields[7].value.trim().parse().unwrap_or(0.7),
+        timeout_seconds: fields[7].value.trim().parse().unwrap_or(60),
+        temperature: fields[8].value.trim().parse().unwrap_or(0.7),
     }))
 }
 

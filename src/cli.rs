@@ -1590,6 +1590,19 @@ fn read_repl_input(
                     return Ok(Some((mode, input)));
                 }
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !input.is_empty() {
+                        input.clear();
+                        cursor = 0;
+                        render_repl_input(
+                            &mut stdout,
+                            &mut input_row,
+                            &mut rendered_rows,
+                            mode,
+                            &input,
+                            cursor,
+                        )?;
+                        continue;
+                    }
                     move_after_repl_input(&mut stdout, input_row, rendered_rows)?;
                     execute!(stdout, DisableBracketedPaste)?;
                     terminal::disable_raw_mode()?;
@@ -1602,6 +1615,17 @@ fn read_repl_input(
                     execute!(stdout, DisableBracketedPaste)?;
                     terminal::disable_raw_mode()?;
                     return Ok(None);
+                }
+                KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    remove_word_before_cursor(&mut input, &mut cursor);
+                    render_repl_input(
+                        &mut stdout,
+                        &mut input_row,
+                        &mut rendered_rows,
+                        mode,
+                        &input,
+                        cursor,
+                    )?;
                 }
                 KeyCode::Backspace => {
                     if cursor > 0 {
@@ -1834,6 +1858,24 @@ fn remove_char_before_cursor(value: &mut String, cursor: &mut usize) {
     *cursor -= 1;
 }
 
+fn remove_word_before_cursor(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut start = (*cursor).min(chars.len());
+    while start > 0 && chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let byte_start = byte_index_for_char(value, start);
+    let byte_end = byte_index_for_char(value, *cursor);
+    value.replace_range(byte_start..byte_end, "");
+    *cursor = start;
+}
+
 fn remove_char_at_cursor(value: &mut String, cursor: usize) {
     if cursor >= value.chars().count() {
         return;
@@ -2009,6 +2051,21 @@ mod repl_input_tests {
         remove_char_at_cursor(&mut input, cursor);
         assert_eq!(input, "abd");
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn input_helpers_remove_word_before_cursor() {
+        let mut input = "hello world  ".to_string();
+        let mut cursor = input.chars().count();
+        remove_word_before_cursor(&mut input, &mut cursor);
+        assert_eq!(input, "hello ");
+        assert_eq!(cursor, 6);
+
+        let mut input = "前面 中间 后面".to_string();
+        let mut cursor = 6;
+        remove_word_before_cursor(&mut input, &mut cursor);
+        assert_eq!(input, "前面 后面");
+        assert_eq!(cursor, 3);
     }
 
     #[test]
