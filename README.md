@@ -4,7 +4,7 @@
 
 # Miyu
 
-Miyu 是一个面向 Linux 和 MacOS 桌面日常的命令行 AI 助手。
+Miyu 是一个活在终端里的二次元少女。
 
 >暂时
 
@@ -19,6 +19,14 @@ Miyu 是从我曾经很喜欢的动画中的角色[久遠寺未有](http://www.m
 `miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。她并非专业的 Coding Agent，而是更偏向聊天日常、游戏娱乐、系统排障等日用场景。并且 `miyu` 还可以无缝与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
 
 ![](./pics/shell-init.png)
+
+## 如何安装？
+
+- Arch Linux
+
+  ```
+  yay -S miyu
+  ```
 
 ### 内置插件
 
