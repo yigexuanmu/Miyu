@@ -2,6 +2,7 @@ mod alarm;
 mod archlinux;
 mod calculator;
 mod deep_research;
+mod deepseek_status;
 mod default_tools;
 mod diagnostics;
 mod exchange_rate;
@@ -52,6 +53,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     moegirl::register(&mut registry);
     hash_codec::register(&mut registry);
     calculator::register(&mut registry);
+    deepseek_status::register(&mut registry);
     vision::register_print(&mut registry, config.clone());
     if config.plugins.memes.enabled {
         memes::register(&mut registry, config.clone(), paths.clone());

@@ -568,6 +568,7 @@ fn readable_tool_name(name: &str) -> &str {
         "aur_search_packages" => "搜索 AUR",
         "aur_get_package_info" => "查看 AUR 包",
         "aur_check_status" => "查询 AUR 状态",
+        "query_deepseek_status" => "查询 DeepSeek 状态",
         "pacman_search" => "搜索软件包",
         "archwiki_query" => "查询 ArchWiki",
         "online_man_search" | "man_search" => "搜索在线手册",
