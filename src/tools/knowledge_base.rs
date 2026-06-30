@@ -525,7 +525,13 @@ impl KnowledgeBase {
             Ok(lock) => lock,
             Err(_) => {
                 if !quiet {
-                    println!("embedding reindex already running");
+                    println!(
+                        "embedding reindex already running; lock file: {}",
+                        lock_path.display()
+                    );
+                    println!(
+                        "if no miyu reindex process is running, remove the stale lock file and retry"
+                    );
                 }
                 return Ok(0);
             }
@@ -1120,11 +1126,9 @@ pub async fn embed_text(
             config.plugins.knowledge_base.embedding_timeout_seconds,
         ))
         .build()?;
+    let url = format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
     let response = client
-        .post(format!(
-            "{}/v1/embeddings",
-            provider.base_url.trim_end_matches('/')
-        ))
+        .post(&url)
         .bearer_auth(api_key)
         .json(&json!({ "model": model, "input": text }))
         .send()
@@ -1133,7 +1137,7 @@ pub async fn embed_text(
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
         bail!(
-            "embedding API error ({status}): {}",
+            "embedding API error at {url} ({status}): {}",
             compact_whitespace(&text)
         );
     }
