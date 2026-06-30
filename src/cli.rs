@@ -809,9 +809,18 @@ fn read_shell_menu_key() -> Result<KeyCode> {
 }
 
 fn remove_shell_hooks(paths: &MiyuPaths) -> Result<()> {
-    shell::fish::uninstall(paths)?;
-    shell::bash::uninstall(paths)?;
-    shell::zsh::uninstall(paths)?;
+    let removed = shell::fish::uninstall(paths)?;
+    let removed = shell::bash::uninstall(paths)? || removed;
+    let removed = shell::zsh::uninstall(paths)? || removed;
+    if !removed {
+        println!(
+            "{}",
+            t(
+                "no installed Miyu shell hooks found",
+                "未找到已安装的 Miyu shell hook"
+            )
+        );
+    }
     Ok(())
 }
 
@@ -1287,8 +1296,8 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     println!(
         "\x1b[2m{}\x1b[0m",
         t(
-            "Tab toggles mode; /help shows commands; exit quits",
-            "Tab 切换模式；/help 查看命令；exit 退出",
+            "Tab toggles mode; Enter sends; Ctrl+J inserts newline",
+            "Tab 切换模式；Enter 发送；Ctrl+J 换行",
         )
     );
     crate::default_kb::check_update_if_due(paths).ok();
@@ -1444,6 +1453,8 @@ fn print_repl_help() {
             "切换 YOLO/PLAN，或补全斜杠菜单"
         )
     );
+    println!("  Enter       {}", t("send message", "发送消息"));
+    println!("  Ctrl+J      {}", t("insert newline", "插入换行"));
     println!(
         "  Up/Down     {}",
         t("browse input history", "切换输入历史")
@@ -1614,6 +1625,17 @@ fn read_repl_input(
                     execute!(stdout, DisableBracketedPaste)?;
                     terminal::disable_raw_mode()?;
                     return Ok(Some((mode, input)));
+                }
+                KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    insert_newline_at_cursor(&mut input, &mut cursor);
+                    render_repl_input(
+                        &mut stdout,
+                        &mut input_row,
+                        &mut rendered_rows,
+                        mode,
+                        &input,
+                        cursor,
+                    )?;
                 }
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                     if !input.is_empty() {
@@ -1877,6 +1899,10 @@ fn insert_str_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
     *cursor += text.chars().count();
 }
 
+fn insert_newline_at_cursor(value: &mut String, cursor: &mut usize) {
+    insert_char_at_cursor(value, cursor, '\n');
+}
+
 fn remove_char_before_cursor(value: &mut String, cursor: &mut usize) {
     let end = byte_index_for_char(value, *cursor);
     let start = byte_index_for_char(value, cursor.saturating_sub(1));
@@ -2101,6 +2127,15 @@ mod repl_input_tests {
         insert_str_at_cursor(&mut input, &mut cursor, "中间");
         assert_eq!(input, "前中间后");
         assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn input_helpers_insert_newline_at_cursor() {
+        let mut input = "前后".to_string();
+        let mut cursor = 1;
+        insert_newline_at_cursor(&mut input, &mut cursor);
+        assert_eq!(input, "前\n后");
+        assert_eq!(cursor, 2);
     }
 
     #[test]

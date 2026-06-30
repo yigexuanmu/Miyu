@@ -38,15 +38,18 @@ pub fn install(paths: &MiyuPaths) -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall(paths: &MiyuPaths) -> Result<()> {
-    remove_file_if_exists(&paths.bash_hook_file)?;
+pub fn uninstall(paths: &MiyuPaths) -> Result<bool> {
+    let removed_file = remove_file_if_exists(&paths.bash_hook_file)?;
     let rc_path = home_file(".bashrc");
-    remove_source_block(&rc_path, BEGIN_MARKER, END_MARKER)?;
-    println!(
-        "{}: bash",
-        t("removed Miyu shell hook", "已移除 Miyu shell hook")
-    );
-    Ok(())
+    let removed_block = remove_source_block(&rc_path, BEGIN_MARKER, END_MARKER)?;
+    let removed = removed_file || removed_block;
+    if removed {
+        println!(
+            "{}: bash",
+            t("removed Miyu shell hook", "已移除 Miyu shell hook")
+        );
+    }
+    Ok(removed)
 }
 
 fn home_file(name: &str) -> std::path::PathBuf {
@@ -76,15 +79,15 @@ fn append_source_block(rc_path: &Path, begin: &str, end: &str, hook_file: &Path)
     Ok(())
 }
 
-fn remove_source_block(rc_path: &Path, begin: &str, end: &str) -> Result<()> {
+fn remove_source_block(rc_path: &Path, begin: &str, end: &str) -> Result<bool> {
     let Ok(existing) = std::fs::read_to_string(rc_path) else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(begin_index) = existing.find(begin) else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(end_relative) = existing[begin_index..].find(end) else {
-        return Ok(());
+        return Ok(false);
     };
     let mut end_index = begin_index + end_relative + end.len();
     if existing.as_bytes().get(end_index) == Some(&b'\r') {
@@ -97,13 +100,13 @@ fn remove_source_block(rc_path: &Path, begin: &str, end: &str) -> Result<()> {
     updated.push_str(&existing[..begin_index]);
     updated.push_str(&existing[end_index..]);
     std::fs::write(rc_path, updated)?;
-    Ok(())
+    Ok(true)
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<()> {
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err.into()),
     }
 }
@@ -126,5 +129,34 @@ mod tests {
         assert!(!hook.contains("${#text} <= 120"));
         assert!(!hook.contains("miyu_shell_syntax_pattern"));
         assert!(!hook.contains("miyu_leading_pattern"));
+    }
+
+    #[test]
+    fn remove_file_if_exists_reports_whether_file_was_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hook.sh");
+
+        assert!(!remove_file_if_exists(&path).unwrap());
+        std::fs::write(&path, hook()).unwrap();
+        assert!(remove_file_if_exists(&path).unwrap());
+        assert!(!remove_file_if_exists(&path).unwrap());
+    }
+
+    #[test]
+    fn remove_source_block_reports_whether_block_was_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let rc_path = temp.path().join(".bashrc");
+        std::fs::write(
+            &rc_path,
+            format!("before\n{BEGIN_MARKER}\nsource hook\n{END_MARKER}\nafter\n"),
+        )
+        .unwrap();
+
+        assert!(remove_source_block(&rc_path, BEGIN_MARKER, END_MARKER).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&rc_path).unwrap(),
+            "before\nafter\n"
+        );
+        assert!(!remove_source_block(&rc_path, BEGIN_MARKER, END_MARKER).unwrap());
     }
 }
