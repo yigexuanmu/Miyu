@@ -16,6 +16,13 @@ const INTERVAL: Duration = Duration::from_millis(80);
 const MIN_FADE_ALPHA: f64 = 0.12;
 const ACTIVE_DOTS: [&str; TRAIL_LEN] = ["▪", "▪", "▫", "▫", "·", "·"];
 const INACTIVE_DOT: &str = "·";
+const BRAILLE_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpinnerStyle {
+    Scanner,
+    Braille,
+}
 
 #[derive(Clone, Copy)]
 struct ScannerState {
@@ -39,6 +46,7 @@ struct WaitSpinnerState {
     sub_phase: Option<String>,
     start: Instant,
     lines_rendered: u16,
+    style: SpinnerStyle,
 }
 
 impl WaitSpinner {
@@ -46,12 +54,13 @@ impl WaitSpinner {
         io::stdout().is_terminal()
     }
 
-    pub(crate) fn start(phase: String) -> Self {
+    pub(crate) fn start(phase: String, style: SpinnerStyle) -> Self {
         let state = Arc::new(Mutex::new(WaitSpinnerState {
             phase,
             sub_phase: None,
             start: Instant::now(),
             lines_rendered: 0,
+            style,
         }));
         let running = Arc::new(AtomicBool::new(true));
         let thread_state = Arc::clone(&state);
@@ -112,24 +121,32 @@ fn run_spinner_loop(state: Arc<Mutex<WaitSpinnerState>>, running: Arc<AtomicBool
             let _ = write_spinner_lines(&output, prev_lines, lines);
         }
         thread::sleep(INTERVAL);
-        frame = (frame + 1) % total_frames();
+        let total = total_frames_for_style(state.lock().map(|s| s.style).unwrap_or(SpinnerStyle::Scanner));
+        frame = (frame + 1) % total.max(1);
     }
 }
 
 fn render_frame(frame: usize, state: &WaitSpinnerState) -> (String, u16) {
-    let scanner = scanner_state(frame % total_frames());
     let elapsed = state.start.elapsed();
     let elapsed = if elapsed > Duration::from_secs(1) {
         format!(" {:.1}s", elapsed.as_secs_f64())
     } else {
         String::new()
     };
-    let cells = (0..WIDTH)
-        .map(|char_index| render_cell(char_index, scanner))
-        .collect::<String>();
+    let spinner_prefix = match state.style {
+        SpinnerStyle::Scanner => {
+            let scanner = scanner_state(frame % total_frames_scanner());
+            (0..WIDTH)
+                .map(|char_index| render_cell(char_index, scanner))
+                .collect::<String>()
+        }
+        SpinnerStyle::Braille => {
+            paint_secondary(BRAILLE_FRAMES[frame % BRAILLE_FRAMES.len()])
+        }
+    };
     let main_line = format!(
         "{} {}{}",
-        cells,
+        spinner_prefix,
         paint_secondary(&state.phase),
         paint_secondary(&elapsed)
     );
@@ -169,8 +186,15 @@ fn paint_inactive_dot(fade: f64) -> String {
     }
 }
 
-fn total_frames() -> usize {
+fn total_frames_scanner() -> usize {
     WIDTH + HOLD_END + (WIDTH - 1) + HOLD_START
+}
+
+fn total_frames_for_style(style: SpinnerStyle) -> usize {
+    match style {
+        SpinnerStyle::Scanner => total_frames_scanner(),
+        SpinnerStyle::Braille => BRAILLE_FRAMES.len(),
+    }
 }
 
 fn scanner_state(mut frame: usize) -> ScannerState {
@@ -298,14 +322,19 @@ fn clear_spinner_lines(lines: u16) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn render_frame_has_phase_without_face() {
-        let state = WaitSpinnerState {
-            phase: "思考".to_string(),
-            sub_phase: None,
+    fn make_state(phase: &str, sub_phase: Option<&str>, style: SpinnerStyle) -> WaitSpinnerState {
+        WaitSpinnerState {
+            phase: phase.to_string(),
+            sub_phase: sub_phase.map(|s| s.to_string()),
             start: Instant::now(),
             lines_rendered: 0,
-        };
+            style,
+        }
+    }
+
+    #[test]
+    fn render_frame_scanner_has_phase_without_face() {
+        let state = make_state("思考", None, SpinnerStyle::Scanner);
 
         let (frame, lines) = render_frame(0, &state);
 
@@ -315,13 +344,23 @@ mod tests {
     }
 
     #[test]
+    fn render_frame_braille_has_phase() {
+        let state = make_state("工具: 输入法诊断×1 运行中", None, SpinnerStyle::Braille);
+
+        let (frame, lines) = render_frame(0, &state);
+
+        assert!(frame.contains("输入法诊断"));
+        assert!(frame.contains("⠋"));
+        assert_eq!(lines, 1);
+    }
+
+    #[test]
     fn render_frame_with_sub_phase_produces_two_lines() {
-        let state = WaitSpinnerState {
-            phase: "工具: 输入法诊断×1 运行中".to_string(),
-            sub_phase: Some("第 1 轮：诊断中".to_string()),
-            start: Instant::now(),
-            lines_rendered: 0,
-        };
+        let state = make_state(
+            "工具: 输入法诊断×1 运行中",
+            Some("第 1 轮：诊断中"),
+            SpinnerStyle::Scanner,
+        );
 
         let (frame, lines) = render_frame(0, &state);
 
@@ -331,16 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn frames_loop_over_pattern() {
-        let state = WaitSpinnerState {
-            phase: "thinking".to_string(),
-            sub_phase: None,
-            start: Instant::now(),
-            lines_rendered: 0,
-        };
+    fn braille_frames_loop_over_pattern() {
+        let state = make_state("thinking", None, SpinnerStyle::Braille);
 
         let (f1, _) = render_frame(0, &state);
-        let (f2, _) = render_frame(total_frames(), &state);
+        let (f2, _) = render_frame(BRAILLE_FRAMES.len(), &state);
+
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn scanner_frames_loop_over_pattern() {
+        let state = make_state("thinking", None, SpinnerStyle::Scanner);
+
+        let (f1, _) = render_frame(0, &state);
+        let (f2, _) = render_frame(total_frames_scanner(), &state);
 
         assert_eq!(f1, f2);
     }
@@ -358,5 +402,20 @@ mod tests {
     fn active_and_inactive_dots_match_pr_style() {
         assert!(render_cell(4, scanner_state(4)).contains("▪"));
         assert!(paint_inactive_dot(1.0).contains(INACTIVE_DOT));
+    }
+
+    #[test]
+    fn braille_cycles_through_all_frames() {
+        let state = make_state("test", None, SpinnerStyle::Braille);
+
+        let chars: std::collections::HashSet<&str> = (0..BRAILLE_FRAMES.len())
+            .map(|i| {
+                let (frame, _) = render_frame(i, &state);
+                let first_char = frame.split_whitespace().next().unwrap_or("");
+                BRAILLE_FRAMES.iter().find(|&&b| first_char.contains(b)).copied().unwrap_or("")
+            })
+            .collect();
+
+        assert_eq!(chars.len(), BRAILLE_FRAMES.len());
     }
 }

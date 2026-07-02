@@ -2,7 +2,7 @@ mod wait_spinner;
 
 use crate::i18n::text as t;
 use crate::llm::{ChatResult, ChatStreamChunk, ChatStreamKind};
-use crate::render::wait_spinner::WaitSpinner;
+use crate::render::wait_spinner::{SpinnerStyle, WaitSpinner};
 use anyhow::Result;
 use crossterm::cursor::{Hide, MoveToColumn, Show};
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
@@ -82,6 +82,10 @@ pub struct StreamRenderer {
     last_tool_summary: String,
     live_summary: bool,
     wait_spinner: Option<WaitSpinner>,
+    subagent_mode: Option<ChatStreamKind>,
+    subagent_reasoning_chars: usize,
+    subagent_reasoning_lines: usize,
+    subagent_reasoning_line_open: bool,
 }
 
 impl StreamRenderer {
@@ -108,6 +112,10 @@ impl StreamRenderer {
             last_tool_summary: String::new(),
             live_summary: io::stdout().is_terminal(),
             wait_spinner: None,
+            subagent_mode: None,
+            subagent_reasoning_chars: 0,
+            subagent_reasoning_lines: 0,
+            subagent_reasoning_line_open: false,
         }
     }
 
@@ -116,7 +124,10 @@ impl StreamRenderer {
             return Ok(());
         }
         self.hide_cursor()?;
-        self.wait_spinner = Some(WaitSpinner::start(t("thinking", "思考").to_string()));
+        self.wait_spinner = Some(WaitSpinner::start(
+            t("thinking", "思考").to_string(),
+            SpinnerStyle::Scanner,
+        ));
         Ok(())
     }
 
@@ -202,6 +213,7 @@ impl StreamRenderer {
             return Ok(());
         }
         self.stop_waiting()?;
+        self.end_subagent_stream_line()?;
         if is_silent_tool(name) && ok {
             return Ok(());
         }
@@ -213,11 +225,11 @@ impl StreamRenderer {
                     stats.ok += 1;
                 } else {
                     stats.error += 1;
-                    stats.progress = None;
                     let mut stdout = io::stdout();
                     write_command_error_block(&mut stdout, output)?;
                     stdout.flush()?;
                 }
+                stats.progress = None;
                 return Ok(());
             }
             if self.tool_call_mode == ToolCallDisplayMode::Full {
@@ -238,8 +250,8 @@ impl StreamRenderer {
                 stats.ok += 1;
             } else {
                 stats.error += 1;
-                stats.progress = None;
             }
+            stats.progress = None;
             let summary = self.tool_summary_text();
             self.last_tool_summary = summary.clone();
             self.render_summary_line(&summary, SummaryStyle::Tool)?;
@@ -255,12 +267,45 @@ impl StreamRenderer {
             self.prepare_for_external_output()?;
             return Ok(());
         }
-        if let Some(json) = message.strip_prefix("__subtool_call__") {
+        if let Some(text) = message.strip_prefix("__subagent_reasoning__") {
+            let text = normalize_stream_text(text);
             if self.tool_call_mode == ToolCallDisplayMode::Full {
-                if let Ok(value) = serde_json::from_str::<Value>(json) {
-                    let tool_name = value.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                self.stop_waiting()?;
+                if self.subagent_mode != Some(ChatStreamKind::Reasoning) {
+                    self.end_subagent_stream_line()?;
+                    let mut stdout = io::stdout();
+                    if self.subagent_mode.is_some() {
+                        writeln!(stdout)?;
+                    }
+                    execute!(stdout, SetForegroundColor(Color::Green))?;
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                }
+                let mut stdout = io::stdout();
+                write!(stdout, "{text}")?;
+                stdout.flush()?;
+                self.subagent_mode = Some(ChatStreamKind::Reasoning);
+            } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                self.record_subagent_reasoning_text(&text);
+                let summary = self.subagent_reasoning_summary_text();
+                self.tool_stats
+                    .entry(name.to_string())
+                    .or_default()
+                    .progress = Some(summary);
+                self.update_tool_summary_display()?;
+            }
+            return Ok(());
+        }
+        if let Some(json) = message.strip_prefix("__subtool_call__") {
+            if let Ok(value) = serde_json::from_str::<Value>(json) {
+                let tool_name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if self.tool_call_mode == ToolCallDisplayMode::Full {
                     let args = value.get("args").and_then(Value::as_str).unwrap_or("");
                     self.stop_waiting()?;
+                    self.end_subagent_stream_line()?;
                     self.end_active_stream_line()?;
                     self.finalize_reasoning_summary()?;
                     let mut stdout = io::stdout();
@@ -276,20 +321,28 @@ impl StreamRenderer {
             return Ok(());
         }
         if let Some(json) = message.strip_prefix("__subtool_result__") {
-            if self.tool_call_mode == ToolCallDisplayMode::Full {
-                if let Ok(value) = serde_json::from_str::<Value>(json) {
-                    let tool_name = value.get("name").and_then(Value::as_str).unwrap_or("unknown");
-                    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            if let Ok(value) = serde_json::from_str::<Value>(json) {
+                let tool_name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                if self.tool_call_mode == ToolCallDisplayMode::Full {
                     let output = value.get("output").and_then(Value::as_str).unwrap_or("");
                     let status = if ok { "ok" } else { "err" };
                     self.stop_waiting()?;
+                    self.end_subagent_stream_line()?;
                     self.end_active_stream_line()?;
                     self.finalize_reasoning_summary()?;
                     let mut stdout = io::stdout();
                     if tool_name == "run_command" {
                         write_command_result_blocks(&mut stdout, output)?;
                     } else {
-                        writeln!(stdout, "result {} {status}", self.display_tool_name(tool_name))?;
+                        writeln!(
+                            stdout,
+                            "result {} {status}",
+                            self.display_tool_name(tool_name)
+                        )?;
                         write_tool_payload(&mut stdout, t("output", "输出"), output)?;
                     }
                     stdout.flush()?;
@@ -302,6 +355,7 @@ impl StreamRenderer {
         }
         if self.tool_call_mode == ToolCallDisplayMode::Full {
             self.stop_waiting()?;
+            self.end_subagent_stream_line()?;
             self.end_active_stream_line()?;
             self.finalize_reasoning_summary()?;
             let mut stdout = io::stdout();
@@ -312,30 +366,39 @@ impl StreamRenderer {
             )?;
             stdout.flush()?;
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
+            self.subagent_reasoning_chars = 0;
+            self.subagent_reasoning_lines = 0;
+            self.subagent_reasoning_line_open = false;
             self.tool_stats
                 .entry(name.to_string())
                 .or_default()
                 .progress = Some(message.to_string());
-            if self.wait_spinner.is_some() {
-                let header = self.tool_summary_header();
-                let sub = self.tool_summary_progress();
-                self.set_tool_waiting_phase(&header, sub.as_deref());
-            } else {
-                self.end_active_stream_line()?;
-                self.finalize_reasoning_summary()?;
-                let new_summary = self.tool_summary_text();
-                if self.summary_line_active && new_summary == self.last_tool_summary {
-                    return Ok(());
-                }
-                self.last_tool_summary = new_summary.clone();
-                self.render_summary_line(&new_summary, SummaryStyle::Tool)?;
+            self.update_tool_summary_display()?;
+        }
+        Ok(())
+    }
+
+    fn update_tool_summary_display(&mut self) -> Result<()> {
+        if self.wait_spinner.is_some() {
+            let header = self.tool_summary_header();
+            let sub = self.tool_summary_progress();
+            self.set_tool_waiting_phase(&header, sub.as_deref());
+        } else {
+            self.end_active_stream_line()?;
+            self.finalize_reasoning_summary()?;
+            let new_summary = self.tool_summary_text();
+            if self.summary_line_active && new_summary == self.last_tool_summary {
+                return Ok(());
             }
+            self.last_tool_summary = new_summary.clone();
+            self.render_summary_line(&new_summary, SummaryStyle::Tool)?;
         }
         Ok(())
     }
 
     pub fn prepare_for_external_output(&mut self) -> Result<()> {
         self.stop_waiting()?;
+        self.end_subagent_stream_line()?;
         if self.summary_line_active {
             let mut stdout = io::stdout();
             execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
@@ -351,6 +414,7 @@ impl StreamRenderer {
 
     pub fn finish(&mut self) -> Result<()> {
         self.stop_waiting()?;
+        self.end_subagent_stream_line()?;
         if self.mode == Some(ChatStreamKind::Content) && !self.plain {
             let mut stdout = io::stdout();
             write!(stdout, "{}", self.markdown.flush())?;
@@ -447,6 +511,48 @@ impl StreamRenderer {
             println!();
         }
         Ok(())
+    }
+
+    fn end_subagent_stream_line(&mut self) -> Result<()> {
+        let was_reasoning = self.subagent_mode == Some(ChatStreamKind::Reasoning);
+        if was_reasoning {
+            execute!(io::stdout(), ResetColor)?;
+        }
+        if self.subagent_mode.is_some() {
+            println!();
+            if was_reasoning {
+                println!();
+            }
+            self.subagent_mode = None;
+        }
+        Ok(())
+    }
+
+    fn record_subagent_reasoning_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.subagent_reasoning_chars += 1;
+            if ch == '\n' {
+                if self.subagent_reasoning_line_open {
+                    self.subagent_reasoning_lines += 1;
+                    self.subagent_reasoning_line_open = false;
+                }
+            } else {
+                self.subagent_reasoning_line_open = true;
+            }
+        }
+    }
+
+    fn subagent_reasoning_summary_text(&self) -> String {
+        let line_count = self.subagent_reasoning_lines
+            + usize::from(self.subagent_reasoning_line_open);
+        format!(
+            "{} · {} {} · {} {}",
+            t("thinking", "思考"),
+            line_count,
+            t("lines", "行"),
+            self.subagent_reasoning_chars,
+            t("chars", "字符")
+        )
     }
 
     fn finalize_tools_summary(&mut self) -> Result<()> {
@@ -546,16 +652,11 @@ impl StreamRenderer {
             .tool_stats
             .iter()
             .map(|(name, stats)| {
-                let header = tool_status_text(&self.display_tool_name(name), stats);
+                let header = tool_status_text(&self.display_tool_name(name), stats, is_subagent_tool(name));
                 stats.progress.as_ref().map_or(header.clone(), |message| {
                     let progress = message
                         .lines()
-                        .filter(|line| {
-                            let l = line.trim();
-                            !l.is_empty()
-                                && !l.starts_with("__subtool_call__")
-                                && !l.starts_with("__subtool_result__")
-                        })
+                        .filter(|line| !line.trim().is_empty())
                         .map(|line| format!("↳ {}", clip_progress_line(line, 120)))
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -575,7 +676,7 @@ impl StreamRenderer {
         let parts = self
             .tool_stats
             .iter()
-            .map(|(name, stats)| tool_status_text(&self.display_tool_name(name), stats))
+            .map(|(name, stats)| tool_status_text(&self.display_tool_name(name), stats, is_subagent_tool(name)))
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}: {parts}", t("tools", "工具"))
@@ -586,12 +687,7 @@ impl StreamRenderer {
             if let Some(message) = &stats.progress {
                 let progress = message
                     .lines()
-                    .filter(|line| {
-                        let l = line.trim();
-                        !l.is_empty()
-                            && !l.starts_with("__subtool_call__")
-                            && !l.starts_with("__subtool_result__")
-                    })
+                    .filter(|line| !line.trim().is_empty())
                     .map(|line| format!("↳ {}", clip_progress_line(line, 120)))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -642,7 +738,7 @@ impl StreamRenderer {
             return Ok(());
         }
         if self.wait_spinner.is_none() {
-            self.wait_spinner = Some(WaitSpinner::start(phase));
+            self.wait_spinner = Some(WaitSpinner::start(phase, SpinnerStyle::Scanner));
         } else {
             self.set_waiting_phase(phase);
         }
@@ -668,7 +764,7 @@ impl StreamRenderer {
             self.clear_summary_lines()?;
         }
         if self.wait_spinner.is_none() {
-            self.wait_spinner = Some(WaitSpinner::start(header));
+            self.wait_spinner = Some(WaitSpinner::start(header, SpinnerStyle::Braille));
         } else {
             self.set_waiting_phase(header);
         }
@@ -714,18 +810,19 @@ fn style_summary_text(text: &str, style: SummaryStyle) -> String {
     }
 }
 
-fn tool_status_text(name: &str, stats: &ToolStats) -> String {
+fn tool_status_text(name: &str, stats: &ToolStats, subagent: bool) -> String {
     let calls = stats.calls.max(stats.ok + stats.error).max(1);
     let running = stats.calls.saturating_sub(stats.ok + stats.error);
     if calls == 1 {
+        let suffix = if subagent { "" } else { "×1" };
         if running > 0 {
-            return format!("{name}×1 {}", t("running", "运行中"));
+            return format!("{name}{suffix} {}", t("running", "运行中"));
         }
         if stats.error > 0 {
-            return format!("{name}×1 err");
+            return format!("{name}{suffix} err");
         }
         if stats.ok > 0 {
-            return format!("{name}×1 ok");
+            return format!("{name}{suffix} ok");
         }
     }
     if running > 0 {
@@ -748,6 +845,13 @@ fn tool_status_text(name: &str, stats: &ToolStats) -> String {
 
 fn is_silent_tool(name: &str) -> bool {
     matches!(name, "show_meme")
+}
+
+fn is_subagent_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "linux_input_method_diagnose" | "linux_game_compatibility" | "deep_research"
+    )
 }
 
 fn readable_tool_name(name: &str) -> &str {
@@ -2087,8 +2191,8 @@ mod tests {
             progress: None,
         };
         assert_eq!(
-            tool_status_text("deep_research", &stats),
-            "deep_research×1 运行中"
+            tool_status_text("grep", &stats, false),
+            "grep×1 运行中"
         );
     }
 
@@ -2101,8 +2205,32 @@ mod tests {
             progress: None,
         };
         assert_eq!(
-            tool_status_text("deep_research", &stats),
-            "deep_research×1 ok"
+            tool_status_text("grep", &stats, false),
+            "grep×1 ok"
+        );
+    }
+
+    #[test]
+    fn tool_status_subagent_tool_omits_count_suffix() {
+        let stats = ToolStats {
+            calls: 1,
+            ok: 0,
+            error: 0,
+            progress: None,
+        };
+        assert_eq!(
+            tool_status_text("linux_input_method_diagnose", &stats, true),
+            "linux_input_method_diagnose 运行中"
+        );
+        let stats = ToolStats {
+            calls: 1,
+            ok: 1,
+            error: 0,
+            progress: None,
+        };
+        assert_eq!(
+            tool_status_text("deep_research", &stats, true),
+            "deep_research ok"
         );
     }
 
@@ -2115,7 +2243,7 @@ mod tests {
             progress: None,
         };
         assert_eq!(
-            tool_status_text("grep", &stats),
+            tool_status_text("grep", &stats, false),
             "grep×3 运行中:1 ok:1 err:1"
         );
     }

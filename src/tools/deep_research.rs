@@ -1,7 +1,7 @@
-use super::{ToolProgress, ToolRegistry, ToolSpec};
+use super::{readable_tool_name, ToolProgress, ToolRegistry, ToolSpec};
 use crate::config::{AppConfig, DeepResearchPluginConfig};
-use crate::i18n::text as t;
-use crate::llm::{ChatMessage, ChatResult, OpenAiCompatibleClient, Usage};
+use crate::i18n::{is_zh, text as t};
+use crate::llm::{ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind, OpenAiCompatibleClient, Usage};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use chrono::Local;
@@ -95,6 +95,19 @@ impl ResearchProgress {
 
     fn subtool(&self, message: impl Into<String>) {
         if self.enabled && self.mode == ResearchProgressMode::Full {
+            self.progress.report(message.into());
+        }
+    }
+
+    fn reasoning(&self, text: &str) {
+        if self.enabled && self.mode != ResearchProgressMode::Hidden {
+            self.progress
+                .report(format!("__subagent_reasoning__{}", text));
+        }
+    }
+
+    fn subtool_text(&self, message: impl Into<String>) {
+        if self.enabled && self.mode == ResearchProgressMode::Summary {
             self.progress.report(message.into());
         }
     }
@@ -304,7 +317,12 @@ async fn run_deep_research(
                     ChatMessage::plain("user", review_prompt.clone()),
                 ],
                 Vec::new(),
-                |_| Ok(()),
+                |chunk: ChatStreamChunk| {
+                    if chunk.kind == ChatStreamKind::Reasoning {
+                        progress.reasoning(&chunk.text);
+                    }
+                    Ok(())
+                },
             )
             .await?;
         state
@@ -470,7 +488,12 @@ async fn chat_with_tools(
     let mut steps = 0usize;
     loop {
         let result = client
-            .chat_stream(messages.clone(), definitions.clone(), |_| Ok(()))
+            .chat_stream(messages.clone(), definitions.clone(), |chunk: ChatStreamChunk| {
+                if chunk.kind == ChatStreamKind::Reasoning {
+                    progress.reasoning(&chunk.text);
+                }
+                Ok(())
+            })
             .await?;
         if result.tool_calls.is_empty() {
             return Ok(result);
@@ -496,6 +519,14 @@ async fn chat_with_tools(
                 let mut state = state.lock().expect("deep research state lock");
                 state.stats.tool_calls += 1;
             }
+            progress.subtool_text(if is_zh() {
+                format!(
+                    "工具 #{steps}：{} 运行中",
+                    readable_tool_name(&call.function.name)
+                )
+            } else {
+                format!("tool #{steps}: {} running", call.function.name)
+            });
             progress.subtool(format!(
                 "__subtool_call__{}",
                 json!({
@@ -527,6 +558,14 @@ async fn chat_with_tools(
                     state.stats.tool_errors += 1;
                 }
             }
+            progress.subtool_text(if is_zh() {
+                format!(
+                    "工具 #{steps}：{} ok",
+                    readable_tool_name(&call.function.name)
+                )
+            } else {
+                format!("tool #{steps}: {} ok", call.function.name)
+            });
             progress.subtool(format!(
                 "__subtool_result__{}",
                 json!({

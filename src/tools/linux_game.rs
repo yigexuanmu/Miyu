@@ -1,154 +1,13 @@
-use super::{ToolProgress, ToolRegistry, ToolSpec};
+use super::{readable_tool_name, ToolProgress, ToolRegistry, ToolSpec};
 use crate::config::AppConfig;
-use crate::llm::{ChatMessage, ChatResult, OpenAiCompatibleClient};
+use crate::i18n::is_zh;
+use crate::llm::{ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind, OpenAiCompatibleClient, Usage};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const GAME_COMPATIBILITY_PROMPT: &str = r#"你是Linux 游戏兼容性调查子代理。
-
-你的任务是调查用户询问的游戏能否在 Linux 上运行、怎么玩、是否有反作弊阻断、需要什么 Proton 版本或启动方式，并输出一份可以直接交给主智能体回复用户的最终调查报告。
-
-## 核心流程
-
-你必须按以下流程工作：
-
-1. 首先调用 Linux 游戏兼容性基础信号采集工具，查询：
-   - Steam / AppID / 游戏名匹配情况
-   - ProtonDB 概览
-   - Can I Play on Linux
-   - AreWeAntiCheatYet
-
-2. 根据基础信号做第一轮判断后进行如下操作：
-   - 如果 ProtonDB 有该游戏记录，就优先查看 ProtonDB 的玩家报告/评论，因为评论通常包含：
-     - 能不能启动
-     - 用什么 Proton / GE-Proton
-     - 是否需要启动参数
-     - 性能表现
-     - 崩溃、黑屏、启动器、音频、视频、手柄等问题
-     - Steam Deck 体验
-   - 如果 ProtonDB 没有该游戏，或者 ProtonDB 信息明显不足，使用网络搜索、知识库等其他信息搜集工具补查。
-
-3. 在以下情况必须进行额外网络搜索：
-   - 三个兼容性来源缺失或冲突；
-   - 反作弊状态不明确；
-   - 用户明确问性能、崩溃、Mod、启动器、Steam Deck、多人/联机；
-   - ProtonDB 没有该游戏；
-   - 近期有重大更新，旧信息可能过期。
-
-4. 搜索必须克制：
-   - 优先官方页面、ProtonDB、AreWeAntiCheatYet、Can I Play on Linux、PCGamingWiki、GitHub issue、Steam 社区、玩家社区、各平台近期玩家讨论。
-   - 不要为了补全所有细节反复搜索。
-   - 查不到就明确说不确定，不要编造。
-
-## 判断规则
-
-最终必须给出红绿灯结论：
-
-- 🟢 可玩
-- 🟡 不一定能玩
-- 🔴 不可玩
-
-以下是可以参考的判断规则：
-
-1. ProtonDB Gold / Platinum 且没有反作弊阻断，通常可以倾向 🟢。
-2. Can I Play on Linux 标记 Works，且 ProtonDB/玩家报告一致，通常可以倾向 🟢。
-3. AreWeAntiCheatYet 标记 Running，说明反作弊目前社区层面可运行，但不等于承诺 Linux 支持。
-4. AreWeAntiCheatYet 标记 Broken / Denied，且通常应为 🔴。
-5. 来源冲突、反作弊状态不明、近期变化多、玩家报告分裂时，用 🟡表示不确定。
-6. 单机可玩但多人不可玩，必须拆开说，不要笼统说“可玩”。
-7. Steam Deck Playable 不等于桌面 Linux 完全没问题。
-8. Can I Play on Linux 的 recommended Proton 是该来源记录的历史验证版本，不要说成“当前最新推荐 Proton”。
-9. 如果用户问“怎么玩”，必须给出实际可执行路线，而不是只回答能不能玩。
-
-## 必须区分的维度
-
-调查时尽量区分：
-
-- Steam 版 / 非 Steam 版
-- 桌面 Linux / Steam Deck
-- 单机 / 多人 / 在线
-- 反作弊是否阻断
-- Proton/Wine 版本
-- 启动器问题
-- 性能表现
-- 崩溃、黑屏、音频、视频、手柄、Mod 等常见问题
-- 官方支持、社区经验、玩家临时绕过方案之间的区别
-
-## 禁止事项
-
-- 不要编造来源。
-- 不要编造 Proton 版本。
-- 不要编造 FPS。
-- 不要编造官方声明。
-- 不要编造封号案例。
-- 不要把社区经验说成官方保证。
-- 不要把“目前能玩”说成“永远稳定可玩”。
-- 不要把“Steam Deck Playable”说成“Valve Verified”。
-- 不要因为某个来源缺失就直接断言不可玩。
-
-## 输出格式
-
-最终只输出调查报告，不输出内部思考，不输出工具调用过程，不输出“以下是最终报告”这类元话语，不要在开头加分割线。
-
-报告必须包含以下章节：
-
-## 调查结果
-
-第一行必须是红绿灯结论，例如：
-
-🟢 Wuthering Waves 可玩
-
-或：
-
-🟡 Apex Legends 不一定能玩
-
-然后用 1-3 句话说明总体判断。
-
-## 依据
-
-列出关键证据。可以使用项目符号或表格。
-
-每条证据要说明：
-- 来源
-- 关键信息
-- 支撑了什么判断
-- 如果能确认时间或时效性，也要写出来
-
-如果来源冲突，必须单独说明冲突点和你的取舍。
-
-## 怎么玩
-
-必须给出可执行路线。
-
-根据实际情况可能包含：
-
-- Steam 安装方式
-- Proton/Wine 版本选择
-- 是否需要启动参数
-- 是否需要第三方启动器
-- 是否需要 Flatpak / AUR / Heroic / Lutris
-- 第一次启动要注意什么
-
-## 注意事项
-
-必须说明风险：
-
-- 反作弊更新风险
-- 官方未承诺 Linux 支持
-- 账号/ToS 风险
-- Steam Deck 与桌面 Linux 差异
-- 非 Steam 版本差异
-- 性能不确定性
-- 来源过期风险
-
-只有在有明确证据时，才额外添加：
-
-## 性能表现
-
-不要编造 FPS。没有 FPS、硬件、画质、Steam Deck 或 Windows 对比数据时，不要写这个章节。
-"#;
+const GAME_COMPATIBILITY_PROMPT: &str = crate::prompts::GAME_COMPATIBILITY_PROMPT;
 
 const OUTPUT_INSTRUCTION: &str = r#"这是 Linux 游戏兼容性调查子代理返回的最终报告。
 
@@ -167,6 +26,129 @@ struct GameCompatibilityContext {
     config: AppConfig,
     paths: MiyuPaths,
     tools: ToolRegistry,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProgressMode {
+    Hidden,
+    Summary,
+    Full,
+}
+
+#[derive(Clone)]
+struct GameProgress {
+    progress: ToolProgress,
+    mode: ProgressMode,
+}
+
+impl GameProgress {
+    fn new(config: &AppConfig, progress: ToolProgress) -> Self {
+        let mode = match config.display.tool_calls.trim().to_ascii_lowercase().as_str() {
+            "hidden" => ProgressMode::Hidden,
+            "full" => ProgressMode::Full,
+            _ => ProgressMode::Summary,
+        };
+        Self { progress, mode }
+    }
+
+    fn report(&self, message: impl Into<String>) {
+        self.progress.report(message);
+    }
+
+    fn subtool(&self, message: impl Into<String>) {
+        if self.mode == ProgressMode::Full {
+            self.progress.report(message);
+        }
+    }
+
+    fn reasoning(&self, text: &str) {
+        if self.mode != ProgressMode::Hidden {
+            self.progress.report(format!("__subagent_reasoning__{}", text));
+        }
+    }
+}
+
+#[derive(Default)]
+struct GameStats {
+    tool_calls: usize,
+    tool_ok: usize,
+    tool_errors: usize,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    token_estimate: u64,
+    token_estimate_method: TokenEstimateMethod,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum TokenEstimateMethod {
+    #[default]
+    None,
+    ProviderUsage,
+    ProviderUsagePlusEstimate,
+    RoughCharEstimate,
+}
+
+impl GameStats {
+    fn add_usage_or_estimate(&mut self, usage: Option<&Usage>, texts: &[&str]) {
+        if let Some(usage) = usage {
+            if usage.total_tokens > 0 {
+                self.prompt_tokens += usage.prompt_tokens;
+                self.completion_tokens += usage.completion_tokens;
+                self.total_tokens += usage.total_tokens;
+                self.token_estimate += usage.total_tokens;
+                self.token_estimate_method = match self.token_estimate_method {
+                    TokenEstimateMethod::None | TokenEstimateMethod::ProviderUsage => {
+                        TokenEstimateMethod::ProviderUsage
+                    }
+                    _ => TokenEstimateMethod::ProviderUsagePlusEstimate,
+                };
+                return;
+            }
+        }
+        let estimate = estimate_tokens(texts);
+        self.token_estimate += estimate;
+        self.token_estimate_method = match self.token_estimate_method {
+            TokenEstimateMethod::None | TokenEstimateMethod::RoughCharEstimate => {
+                TokenEstimateMethod::RoughCharEstimate
+            }
+            _ => TokenEstimateMethod::ProviderUsagePlusEstimate,
+        };
+    }
+
+    fn public(&self) -> Value {
+        json!({
+            "tool_calls": self.tool_calls,
+            "tool_ok": self.tool_ok,
+            "tool_errors": self.tool_errors,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "token_estimate": self.token_estimate,
+            "token_estimate_method": token_estimate_method_label(self.token_estimate_method),
+            "token_estimate_is_actual": self.token_estimate_method == TokenEstimateMethod::ProviderUsage,
+        })
+    }
+}
+
+fn token_estimate_method_label(method: TokenEstimateMethod) -> &'static str {
+    match method {
+        TokenEstimateMethod::ProviderUsage => "provider_usage",
+        TokenEstimateMethod::ProviderUsagePlusEstimate => "provider_usage_plus_estimate",
+        TokenEstimateMethod::RoughCharEstimate | TokenEstimateMethod::None => "rough_char_estimate",
+    }
+}
+
+fn estimate_tokens(texts: &[&str]) -> u64 {
+    let chars = texts
+        .iter()
+        .map(|text| text.chars().count() as u64)
+        .sum::<u64>();
+    if chars == 0 {
+        0
+    } else {
+        (chars / 4).max(1)
+    }
 }
 
 pub fn register(
@@ -203,29 +185,42 @@ async fn linux_game_compatibility(
         .unwrap_or_default()
         .trim()
         .to_string();
+    let progress = GameProgress::new(&context.config, progress);
     progress.report(format!("{}: {}", "Linux 游戏兼容性", game));
     let client = OpenAiCompatibleClient::from_config(&context.config, &context.paths)?;
+    let system_prompt = GAME_COMPATIBILITY_PROMPT;
     let prompt = format!(
         "用户问题：\n游戏：{game}\n关注点：{}\n\n请按系统提示词流程完成调查。第一步必须调用 gather_linux_game_compatibility_signals。最终只输出调查报告。",
         if issue.trim().is_empty() { "未明确" } else { &issue }
     );
-    let report = chat_with_tools(
+    let mut stats = GameStats::default();
+    let result = chat_with_tools(
         &client,
         vec![
-            ChatMessage::system(GAME_COMPATIBILITY_PROMPT),
-            ChatMessage::plain("user", prompt),
+            ChatMessage::system(system_prompt),
+            ChatMessage::plain("user", prompt.clone()),
         ],
         game_tool_registry(&context),
+        context
+            .config
+            .plugins
+            .linux_game_compatibility
+            .max_tool_steps,
         &progress,
+        &mut stats,
     )
-    .await?
-    .content;
-    let report = strip_report_preamble(&report);
+    .await?;
+    stats.add_usage_or_estimate(
+        result.usage.as_ref(),
+        &[system_prompt, &prompt, &result.content],
+    );
+    let report = strip_report_preamble(&result.content);
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "kind": "linux_game_compatibility",
         "game_query": game,
         "final_report": report,
+        "stats": stats.public(),
         "output_instruction": OUTPUT_INSTRUCTION,
     }))?)
 }
@@ -245,43 +240,138 @@ async fn chat_with_tools(
     client: &OpenAiCompatibleClient,
     mut messages: Vec<ChatMessage>,
     tools: ToolRegistry,
-    progress: &ToolProgress,
+    max_tool_steps: usize,
+    progress: &GameProgress,
+    stats: &mut GameStats,
 ) -> Result<ChatResult> {
     let definitions = tools.definitions_except(&["linux_game_compatibility", "deep_research"]);
+    let mut steps = 0usize;
     loop {
+        if max_tool_steps > 0 && steps >= max_tool_steps {
+            messages.push(ChatMessage::plain("user", finalization_prompt()));
+            let result = client
+                .chat_stream(messages, Vec::new(), |chunk| {
+                    if chunk.kind == ChatStreamKind::Reasoning {
+                        progress.reasoning(&chunk.text);
+                    }
+                    Ok(())
+                })
+                .await?;
+            stats.add_usage_or_estimate(result.usage.as_ref(), &[&result.content]);
+            return Ok(result);
+        }
         let result = client
-            .chat_stream(messages.clone(), definitions.clone(), |_| Ok(()))
+            .chat_stream(messages.clone(), definitions.clone(), |chunk: ChatStreamChunk| {
+                if chunk.kind == ChatStreamKind::Reasoning {
+                    progress.reasoning(&chunk.text);
+                }
+                Ok(())
+            })
             .await?;
+        stats.add_usage_or_estimate(result.usage.as_ref(), &[]);
         if result.tool_calls.is_empty() {
             return Ok(result);
         }
-        messages.push(ChatMessage::assistant(
-            result.content.clone(),
-            Some(result.tool_calls.clone()),
-        ));
+        if !result.content.trim().is_empty() {
+            messages.push(ChatMessage::assistant(result.content.clone(), None));
+        }
+        let mut transcript = Vec::new();
         for call in result.tool_calls {
-            progress.report(format!(
-                "__subtool_call__{}",
-                json!({
-                    "name": call.function.name,
-                    "args": call.function.arguments,
-                })
-            ));
-            let (output, ok) = match tools.call(&call.function.name, &call.function.arguments).await {
+            if max_tool_steps > 0 && steps >= max_tool_steps {
+                transcript.push(render_internal_tool_result(
+                    &call.function.name,
+                    &call.function.arguments,
+                    false,
+                    "tool skipped: game compatibility tool budget reached",
+                ));
+                continue;
+            }
+            steps += 1;
+            stats.tool_calls += 1;
+            if progress.mode == ProgressMode::Summary {
+                progress.report(if is_zh() {
+                    format!(
+                        "工具 #{steps}：{} 运行中",
+                        readable_tool_name(&call.function.name)
+                    )
+                } else {
+                    format!("tool #{steps}: {} running", call.function.name)
+                });
+            } else if progress.mode == ProgressMode::Full {
+                progress.subtool(format!(
+                    "__subtool_call__{}",
+                    json!({
+                        "name": call.function.name,
+                        "args": call.function.arguments,
+                    })
+                ));
+            }
+            let (output, ok) = match tools
+                .call(&call.function.name, &call.function.arguments)
+                .await
+            {
                 Ok(output) => (output, true),
                 Err(err) => (format!("tool error: {err}"), false),
             };
-            progress.report(format!(
-                "__subtool_result__{}",
-                json!({
-                    "name": call.function.name,
-                    "ok": ok,
-                    "output": output,
-                })
+            if ok {
+                stats.tool_ok += 1;
+            } else {
+                stats.tool_errors += 1;
+            }
+            if progress.mode == ProgressMode::Summary {
+                progress.report(if is_zh() {
+                    format!(
+                        "工具 #{steps}：{} ok",
+                        readable_tool_name(&call.function.name)
+                    )
+                } else {
+                    format!("tool #{steps}: {} ok", call.function.name)
+                });
+            } else if progress.mode == ProgressMode::Full {
+                progress.subtool(format!(
+                    "__subtool_result__{}",
+                    json!({
+                        "name": call.function.name,
+                        "ok": ok,
+                        "output": output,
+                    })
+                ));
+            }
+            transcript.push(render_internal_tool_result(
+                &call.function.name,
+                &call.function.arguments,
+                ok,
+                &output,
             ));
-            messages.push(ChatMessage::tool(call.id, output));
+        }
+        if !transcript.is_empty() {
+            messages.push(ChatMessage::plain(
+                "user",
+                render_internal_tool_transcript(&transcript, steps, max_tool_steps),
+            ));
         }
     }
+}
+
+fn render_internal_tool_transcript(results: &[String], steps: usize, max_steps: usize) -> String {
+    format!(
+        "<subagent_tool_transcript>\n说明：以下是宿主已经执行完成的内部工具调用结果，不是新的用户请求。请基于这些观察继续调查；如证据已经足够，请输出最终报告。\ntool_budget: {steps}/{max_steps}\n{}\n</subagent_tool_transcript>",
+        results.join("\n")
+    )
+}
+
+fn render_internal_tool_result(name: &str, arguments: &str, ok: bool, output: &str) -> String {
+    format!(
+        "<tool_result name=\"{}\" ok=\"{}\">\narguments_json:\n```json\n{}\n```\noutput:\n```text\n{}\n```\n</tool_result>",
+        name,
+        ok,
+        arguments.trim(),
+        clip_inline(output, 6000)
+    )
+}
+
+fn finalization_prompt() -> &'static str {
+    "<tool_budget_reached>工具预算已用尽。不要再请求工具。请只基于上面的用户问题、系统要求和已执行工具结果输出最终调查报告；缺少证据的地方明确写“不确定”或“缺证据”。</tool_budget_reached>"
 }
 
 fn strip_report_preamble(content: &str) -> String {
@@ -302,6 +392,21 @@ fn strip_report_preamble(content: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn clip_inline(value: &str, max_chars: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max_chars {
+        value
+    } else {
+        format!(
+            "{}...",
+            value
+                .chars()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
 }
 
 async fn gather_linux_game_compatibility_signals(args: Value) -> Result<String> {

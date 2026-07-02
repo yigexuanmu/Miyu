@@ -250,7 +250,7 @@ pub struct PluginsConfig {
     #[serde(default)]
     pub package_advisor: PluginEnabledConfig,
     #[serde(default)]
-    pub linux_game_compatibility: PluginEnabledConfig,
+    pub linux_game_compatibility: LinuxGameCompatibilityConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsPluginConfig,
     #[serde(default)]
@@ -261,6 +261,14 @@ pub struct PluginsConfig {
 pub struct PluginEnabledConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinuxGameCompatibilityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_subagent_max_tool_steps")]
+    pub max_tool_steps: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +339,8 @@ pub struct DeepDiagnosePluginConfig {
     pub max_final_answer_chars: usize,
     #[serde(default = "default_deep_research_tool_timeout")]
     pub tool_call_timeout_seconds: u64,
+    #[serde(default = "default_subagent_max_tool_steps")]
+    pub max_tool_steps: usize,
     #[serde(default = "default_true")]
     pub show_progress: bool,
 }
@@ -544,7 +554,7 @@ impl Default for PluginsConfig {
             hash_codec: PluginEnabledConfig::default(),
             calculator: CalculatorPluginConfig::default(),
             package_advisor: PluginEnabledConfig::default(),
-            linux_game_compatibility: PluginEnabledConfig::default(),
+            linux_game_compatibility: LinuxGameCompatibilityConfig::default(),
             diagnostics: DiagnosticsPluginConfig::default(),
             memory: MemoryConfig::default(),
         }
@@ -555,6 +565,15 @@ impl Default for PluginEnabledConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+        }
+    }
+}
+
+impl Default for LinuxGameCompatibilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_tool_steps: default_subagent_max_tool_steps(),
         }
     }
 }
@@ -610,6 +629,7 @@ impl Default for DeepDiagnosePluginConfig {
             max_tool_steps_per_round: default_deep_research_max_tool_steps(),
             max_final_answer_chars: 0,
             tool_call_timeout_seconds: default_deep_research_tool_timeout(),
+            max_tool_steps: default_subagent_max_tool_steps(),
             show_progress: default_true(),
         }
     }
@@ -1500,6 +1520,10 @@ fn default_deep_research_max_tool_steps() -> usize {
 
 fn default_deep_research_tool_timeout() -> u64 {
     90
+}
+
+fn default_subagent_max_tool_steps() -> usize {
+    100
 }
 
 fn default_image_generation_provider_type() -> String {

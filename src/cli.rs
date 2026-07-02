@@ -2265,7 +2265,7 @@ mod repl_input_tests {
         let lines = (0..20)
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>();
-        let visible = repl_visible_input_lines("[YOLO] > ", &lines, 12);
+        let visible = repl_visible_input_lines("[YOLO] > ", &lines, 12, true);
 
         assert_eq!(visible.len(), 3);
         assert_eq!(visible[0], "line 0");
