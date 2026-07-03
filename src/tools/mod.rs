@@ -34,14 +34,39 @@ mod xuanxue;
 
 use crate::config::AppConfig;
 use crate::paths::MiyuPaths;
+use std::collections::HashMap;
+use std::sync::RwLock;
 
 #[allow(unused_imports)]
 pub use registry::{empty_parameters, ToolPermission, ToolProgress, ToolRegistry, ToolSpec};
 pub use skills::{register_skills, skills_prompt};
 pub(crate) use scripts::rescan_scripts;
 
-pub fn readable_tool_name(name: &str) -> &str {
-    match name {
+static SCRIPT_DISPLAY_NAMES: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+pub fn register_script_display_names(registry: &ToolRegistry) {
+    let mut map = HashMap::new();
+    for name in registry.tool_names() {
+        if let Some(dn) = registry.display_name(&name) {
+            map.insert(name, dn);
+        }
+    }
+    *SCRIPT_DISPLAY_NAMES.write().unwrap() = Some(map);
+}
+
+pub fn readable_tool_name(name: &str) -> String {
+    if let Ok(guard) = SCRIPT_DISPLAY_NAMES.read() {
+        if let Some(map) = guard.as_ref() {
+            if let Some(dn) = map.get(name) {
+                return dn.clone();
+            }
+        }
+    }
+    builtin_readable_tool_name(name).to_string()
+}
+
+fn builtin_readable_tool_name(name: &str) -> String {
+    let result: &str = match name {
         "run_command" => "运行命令",
         "task" => "子代理任务",
         "read_file" => "读取文件",
@@ -112,18 +137,20 @@ pub fn readable_tool_name(name: &str) -> &str {
         "roll_dice" => "掷骰子",
         "load_skill" => "加载技能",
         "register_script" => "注册脚本",
+        "unregister_script" => "注销脚本",
         "todowrite" => "任务列表",
         "review_aur_package" => "审查 AUR 包",
         "install_aur_package" => "安装 AUR 包",
         "review_pkgbuild_directory" => "审查 PKGBUILD 目录",
-        "linux_game_compatibility" => "查询 Linux 游戏兼容性",
+        "linux_game_compatibility" => "Linux 游戏兼容性调查",
         "gather_linux_game_compatibility_signals" => "收集游戏兼容性",
         "register_linux_game_evidence" => "登记兼容性证据",
         "register_deep_research_topic_title" => "注册研究标题",
         "register_deep_research_reference" => "注册引用来源",
         "remove_deep_research_reference" => "移除引用来源",
         _ => name,
-    }
+    };
+    result.to_string()
 }
 
 pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {

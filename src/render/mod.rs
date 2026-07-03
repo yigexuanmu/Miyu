@@ -132,7 +132,9 @@ impl StreamRenderer {
     }
 
     pub fn write_chunk(&mut self, chunk: ChatStreamChunk) -> Result<()> {
-        self.hide_cursor()?;
+        if !self.plain {
+            self.hide_cursor()?;
+        }
         let text = normalize_stream_text(&chunk.text);
         if self.plain && chunk.kind == ChatStreamKind::Reasoning {
             return Ok(());
@@ -267,6 +269,28 @@ impl StreamRenderer {
         }
         if message == "__external_output__" {
             self.prepare_for_external_output()?;
+            return Ok(());
+        }
+        if let Some(text) = message.strip_prefix("__subagent_stats__") {
+            if self.tool_call_mode == ToolCallDisplayMode::Full {
+                self.stop_waiting()?;
+                self.end_subagent_stream_line()?;
+                self.end_active_stream_line()?;
+                self.finalize_reasoning_summary()?;
+                let mut stdout = io::stdout();
+                writeln!(
+                    stdout,
+                    "progress {}: {text}",
+                    self.display_tool_name(name)
+                )?;
+                stdout.flush()?;
+            } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                self.tool_stats
+                    .entry(name.to_string())
+                    .or_default()
+                    .final_progress = Some(text.to_string());
+                self.update_tool_summary_display()?;
+            }
             return Ok(());
         }
         if let Some(text) = message.strip_prefix("__subagent_reasoning__") {
@@ -655,12 +679,15 @@ impl StreamRenderer {
             .tool_stats
             .iter()
             .map(|(name, stats)| {
-                let header = tool_status_text(&self.display_tool_name(name), stats, is_subagent_tool(name));
-                stats.progress.as_ref().map_or(header.clone(), |message| {
+                let display = self.display_tool_name(name);
+                let header = tool_status_text(&display, stats, is_subagent_tool(name));
+                let progress_text = stats.final_progress.as_ref().or(stats.progress.as_ref());
+                let progress_prefix = if stats.final_progress.is_some() { "✓" } else { "↳" };
+                progress_text.map_or(header.clone(), |message| {
                     let progress = message
                         .lines()
                         .filter(|line| !line.trim().is_empty())
-                        .map(|line| format!("↳ {}", clip_progress_line(line, 120)))
+                        .map(|line| format!("{progress_prefix} {}", clip_progress_line(line, 120)))
                         .collect::<Vec<_>>()
                         .join("\n");
                     if progress.is_empty() {
@@ -679,7 +706,10 @@ impl StreamRenderer {
         let parts = self
             .tool_stats
             .iter()
-            .map(|(name, stats)| tool_status_text(&self.display_tool_name(name), stats, is_subagent_tool(name)))
+            .map(|(name, stats)| {
+                let display = self.display_tool_name(name);
+                tool_status_text(&display, stats, is_subagent_tool(name))
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}: {parts}", t("tools", "工具"))
@@ -702,16 +732,16 @@ impl StreamRenderer {
         None
     }
 
-    fn display_tool_name<'a>(&self, name: &'a str) -> &'a str {
+    fn display_tool_name<'a>(&self, name: &'a str) -> String {
         if self.readable_tool_names {
             readable_tool_name(name)
         } else {
-            name
+            name.to_string()
         }
     }
 
     fn hide_cursor(&mut self) -> Result<()> {
-        if !self.cursor_hidden {
+        if !self.cursor_hidden && !self.plain {
             execute!(io::stdout(), Hide)?;
             self.cursor_hidden = true;
         }
@@ -719,7 +749,7 @@ impl StreamRenderer {
     }
 
     fn show_cursor(&mut self) -> Result<()> {
-        if self.cursor_hidden {
+        if self.cursor_hidden && !self.plain {
             execute!(io::stdout(), Show)?;
             self.cursor_hidden = false;
         }
@@ -798,6 +828,7 @@ struct ToolStats {
     ok: usize,
     error: usize,
     progress: Option<String>,
+    final_progress: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -853,11 +884,11 @@ fn is_silent_tool(name: &str) -> bool {
 fn is_subagent_tool(name: &str) -> bool {
     matches!(
         name,
-        "linux_input_method_diagnose" | "linux_game_compatibility" | "deep_research"
+        "linux_input_method_diagnose" | "linux_game_compatibility" | "deep_research" | "task"
     )
 }
 
-fn readable_tool_name(name: &str) -> &str {
+fn readable_tool_name(name: &str) -> String {
     crate::tools::readable_tool_name(name)
 }
 
@@ -1938,7 +1969,9 @@ impl Drop for StreamRenderer {
             eprintln!();
         }
         let _ = self.show_cursor();
-        let _ = execute!(io::stdout(), ResetColor);
+        if !self.plain {
+            let _ = execute!(io::stdout(), ResetColor);
+        }
     }
 }
 
@@ -2192,6 +2225,7 @@ mod tests {
             ok: 0,
             error: 0,
             progress: None,
+            final_progress: None,
         };
         assert_eq!(
             tool_status_text("grep", &stats, false),
@@ -2206,6 +2240,7 @@ mod tests {
             ok: 1,
             error: 0,
             progress: None,
+            final_progress: None,
         };
         assert_eq!(
             tool_status_text("grep", &stats, false),
@@ -2220,6 +2255,7 @@ mod tests {
             ok: 0,
             error: 0,
             progress: None,
+            final_progress: None,
         };
         assert_eq!(
             tool_status_text("linux_input_method_diagnose", &stats, true),
@@ -2230,6 +2266,7 @@ mod tests {
             ok: 1,
             error: 0,
             progress: None,
+            final_progress: None,
         };
         assert_eq!(
             tool_status_text("deep_research", &stats, true),
@@ -2244,6 +2281,7 @@ mod tests {
             ok: 1,
             error: 1,
             progress: None,
+            final_progress: None,
         };
         assert_eq!(
             tool_status_text("grep", &stats, false),
@@ -2276,7 +2314,7 @@ mod tests {
         assert_eq!(readable_tool_name("search_meme"), "搜索表情包");
         assert_eq!(readable_tool_name("show_meme"), "发送表情");
         assert_eq!(readable_tool_name("add_meme"), "添加表情包");
-        assert_eq!(readable_tool_name("task_agent"), "创建子任务");
+        assert_eq!(readable_tool_name("task"), "子代理任务");
         assert_eq!(
             readable_tool_name("upload_text_to_knowledge_base"),
             "导入知识库"
