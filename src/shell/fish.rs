@@ -84,6 +84,7 @@ mod tests {
             fish_hook_file: temp.path().join("miyu.fish"),
             bash_hook_file: temp.path().join("bash-hook.sh"),
             zsh_hook_file: temp.path().join("zsh-hook.zsh"),
+            scripts_dir: temp.path().join("scripts"),
         };
 
         assert!(!uninstall(&paths).unwrap());

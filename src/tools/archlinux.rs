@@ -1,11 +1,14 @@
 use super::{ToolRegistry, ToolSpec};
+use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 const ARCH_STATUS_BASE_URL: &str = "https://status.archlinux.org";
 const ARCH_STATUS_PAGE_ID: &str = "vmM5ruWEAB";
+const ARCH_NEWS_FEED_URL: &str = "https://archlinux.org/feeds/news/";
+const ARCH_NEWS_CACHE_FILE: &str = "arch_news_last_seen.json";
 
-pub fn register(registry: &mut ToolRegistry) {
+pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
     registry.register(ToolSpec::new("aur_search_packages", "Search AUR packages via official RPC.", json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"search_by":{"type":"string"}},"required":["query"],"additionalProperties":false}), |args| async move { aur_search(args).await }));
     registry.register(ToolSpec::new("aur_get_package_info", "Get AUR package information via official RPC.", json!({"type":"object","properties":{"package_name":{"type":"string"}},"required":["package_name"],"additionalProperties":false}), |args| async move { aur_info(args).await }));
     registry.register(ToolSpec::new("archlinux_official_package_query", "Query official Arch Linux package database. Supports search and exact package details. / 查询 Arch Linux 官方软件包数据库，支持搜索和精确包详情。", json!({"type":"object","properties":{"package_name":{"type":"string","description":"Package name. / 包名。"},"repo":{"type":"string","description":"Repository for detail mode, e.g. core or extra. / 详情模式的仓库，例如 core 或 extra。"},"arch":{"type":"string","description":"Architecture for detail mode, default x86_64. / 详情模式架构，默认 x86_64。"},"mode":{"type":"string","enum":["auto","search","detail"],"description":"auto uses detail when repo is provided, otherwise search. / auto 在提供 repo 时查详情，否则搜索。"}},"required":["package_name"],"additionalProperties":false}), |args| async move { official_package_query(args).await }));
@@ -16,6 +19,26 @@ pub fn register(registry: &mut ToolRegistry) {
         |_| async move { arch_status().await },
     ));
     registry.register(ToolSpec::new("archwiki_query", "Search or read ArchWiki pages.", json!({"type":"object","properties":{"query":{"type":"string"},"title":{"type":"string"},"mode":{"type":"string","enum":["auto","search","page"]}},"additionalProperties":false}), |args| async move { archwiki(args).await }));
+
+    let state_dir = paths.state_dir.clone();
+    registry.register(ToolSpec::new(
+        "archlinux_news",
+        "Fetch recent Arch Linux news. Shows latest articles from archlinux.org news feed. Articles are automatically marked as seen after each query, so subsequent calls show which articles are new since last check. / 获取 Arch Linux 最新新闻。每次查询后自动标记已读，后续调用会标注新增文章。",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of articles to return (1-20). Defaults to 10. / 返回文章数量上限（1-20），默认 10。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        move |args| {
+            let state_dir = state_dir.clone();
+            async move { archlinux_news(args, &state_dir).await }
+        },
+    ));
 }
 
 async fn official_package_query(args: Value) -> Result<String> {
@@ -528,4 +551,286 @@ fn find_latest_down(logs: &[Value]) -> Option<Value> {
         }));
     }
     None
+}
+
+async fn archlinux_news(args: Value, state_dir: &std::path::Path) -> Result<String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, 20) as usize;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("miyu-archlinux-news/0.1")
+        .build()?;
+    let resp = client.get(ARCH_NEWS_FEED_URL).send().await?;
+    if !resp.status().is_success() {
+        bail!(
+            "Arch news feed returned HTTP {}",
+            resp.status()
+        );
+    }
+    let xml = resp.text().await?;
+    let articles = parse_rss_feed(&xml, limit);
+
+    let cache_path = state_dir.join(ARCH_NEWS_CACHE_FILE);
+    let last_seen_url: Option<String> = if cache_path.is_file() {
+        let raw = std::fs::read_to_string(&cache_path)?;
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("last_seen_url").and_then(Value::as_str).map(String::from))
+    } else {
+        None
+    };
+
+    let new_count = if let Some(ref last_url) = last_seen_url {
+        articles.iter().take_while(|a| &a.url != last_url).count()
+    } else {
+        articles.len()
+    };
+
+    let result_articles: Vec<Value> = articles
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            json!({
+                "title": a.title,
+                "url": a.url,
+                "published": a.published,
+                "author": a.author,
+                "description": a.description,
+                "is_new": i < new_count,
+            })
+        })
+        .collect();
+
+    if let Some(first) = articles.first() {
+        let cache = json!({ "last_seen_url": first.url });
+        std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
+    }
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "success": true,
+        "total": result_articles.len(),
+        "new_count": new_count,
+        "last_seen_url": last_seen_url,
+        "articles": result_articles,
+        "source": ARCH_NEWS_FEED_URL,
+    }))?)
+}
+
+struct NewsArticle {
+    title: String,
+    url: String,
+    published: String,
+    author: String,
+    description: String,
+}
+
+fn parse_rss_feed(xml: &str, limit: usize) -> Vec<NewsArticle> {
+    let mut articles = Vec::new();
+    let mut current: Option<NewsArticle> = None;
+    let mut tag_stack = Vec::new();
+    let mut in_item = false;
+
+    for token in tokenize_xml(xml) {
+        match token {
+            XmlToken::OpenTag(tag) => {
+                tag_stack.push(tag.clone());
+                if tag == "item" {
+                    in_item = true;
+                    current = Some(NewsArticle {
+                        title: String::new(),
+                        url: String::new(),
+                        published: String::new(),
+                        author: String::new(),
+                        description: String::new(),
+                    });
+                }
+            }
+            XmlToken::CloseTag(tag) => {
+                if tag == "item" {
+                    if let Some(article) = current.take() {
+                        articles.push(article);
+                    }
+                    in_item = false;
+                    if articles.len() >= limit {
+                        break;
+                    }
+                }
+                tag_stack.pop();
+            }
+            XmlToken::Text(text) => {
+                if !in_item {
+                    continue;
+                }
+                let current_tag = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                let article = current.as_mut().unwrap();
+                match current_tag {
+                    "title" => {
+                        if article.title.is_empty() {
+                            article.title = decode_xml_entities(&text);
+                        }
+                    }
+                    "link" => {
+                        if article.url.is_empty() {
+                            article.url = text.trim().to_string();
+                        }
+                    }
+                    "pubDate" => {
+                        if article.published.is_empty() {
+                            article.published = text.trim().to_string();
+                        }
+                    }
+                    "dc:creator" | "author" => {
+                        if article.author.is_empty() {
+                            article.author = decode_xml_entities(&text);
+                        }
+                    }
+                    "description" => {
+                        if article.description.is_empty() {
+                            let stripped = html2text::from_read(text.as_bytes(), 2000);
+                            article.description = clip_string(&stripped, 500);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    articles
+}
+
+enum XmlToken {
+    OpenTag(String),
+    CloseTag(String),
+    Text(String),
+}
+
+fn tokenize_xml(xml: &str) -> Vec<XmlToken> {
+    let mut tokens = Vec::new();
+    let mut chars = xml.chars().peekable();
+    let mut text = String::new();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            if !text.trim().is_empty() {
+                tokens.push(XmlToken::Text(std::mem::take(&mut text).trim().to_string()));
+            } else {
+                text.clear();
+            }
+            let mut tag_content = String::new();
+            let mut is_closing = false;
+            if chars.peek() == Some(&'/') {
+                is_closing = true;
+                chars.next();
+            }
+            while let Some(&c) = chars.peek() {
+                if c == '>' {
+                    chars.next();
+                    break;
+                }
+                tag_content.push(c);
+                chars.next();
+            }
+            let tag_content = tag_content.trim();
+            if tag_content.is_empty() || tag_content.starts_with('?') || tag_content.starts_with('!') {
+                continue;
+            }
+            let tag_name = tag_content
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if is_closing {
+                tokens.push(XmlToken::CloseTag(tag_name));
+            } else {
+                if tag_content.ends_with('/') {
+                    tokens.push(XmlToken::OpenTag(tag_name.clone()));
+                    tokens.push(XmlToken::CloseTag(tag_name));
+                } else {
+                    tokens.push(XmlToken::OpenTag(tag_name));
+                }
+            }
+        } else {
+            text.push(ch);
+        }
+    }
+    tokens
+}
+
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn clip_string(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod news_tests {
+    use super::*;
+
+    #[test]
+    fn parses_simple_rss_feed() {
+        let xml = r#"<?xml version="1.0"?>
+<rss>
+  <channel>
+    <item>
+      <title>Test News &amp; Update</title>
+      <link>https://archlinux.org/news/test</link>
+      <pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>
+      <dc:creator>Arch Team</dc:creator>
+      <description>&lt;p&gt;Some description&lt;/p&gt;</description>
+    </item>
+    <item>
+      <title>Second News</title>
+      <link>https://archlinux.org/news/second</link>
+      <pubDate>Tue, 02 Jan 2024 00:00:00 +0000</pubDate>
+      <dc:creator>Another Author</dc:creator>
+      <description>Plain text description</description>
+    </item>
+  </channel>
+</rss>"#;
+        let articles = parse_rss_feed(xml, 10);
+        assert_eq!(articles.len(), 2);
+        assert_eq!(articles[0].title, "Test News & Update");
+        assert_eq!(articles[0].url, "https://archlinux.org/news/test");
+        assert_eq!(articles[0].author, "Arch Team");
+        assert_eq!(articles[1].title, "Second News");
+    }
+
+    #[test]
+    fn parses_rss_feed_with_limit() {
+        let xml = r#"<?xml version="1.0"?>
+<rss>
+  <channel>
+    <item><title>A</title><link>url-a</link><pubDate></pubDate><dc:creator></dc:creator><description></description></item>
+    <item><title>B</title><link>url-b</link><pubDate></pubDate><dc:creator></dc:creator><description></description></item>
+    <item><title>C</title><link>url-c</link><pubDate></pubDate><dc:creator></dc:creator><description></description></item>
+  </channel>
+</rss>"#;
+        let articles = parse_rss_feed(xml, 2);
+        assert_eq!(articles.len(), 2);
+        assert_eq!(articles[0].title, "A");
+        assert_eq!(articles[1].title, "B");
+    }
+
+    #[test]
+    fn decodes_xml_entities() {
+        assert_eq!(decode_xml_entities("a &amp; b &lt; c &gt; d"), "a & b < c > d");
+        assert_eq!(decode_xml_entities("&quot;hi&quot;"), "\"hi\"");
+    }
 }

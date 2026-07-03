@@ -16,6 +16,7 @@ pub struct MiyuPaths {
     pub fish_hook_file: PathBuf,
     pub bash_hook_file: PathBuf,
     pub zsh_hook_file: PathBuf,
+    pub scripts_dir: PathBuf,
 }
 
 impl MiyuPaths {
@@ -39,6 +40,7 @@ impl MiyuPaths {
         let fish_hook_file = base.config_dir().join("fish/conf.d/miyu.fish");
         let bash_hook_file = config_dir.join("shell/bash-hook.sh");
         let zsh_hook_file = config_dir.join("shell/zsh-hook.zsh");
+        let scripts_dir = config_dir.join("scripts");
 
         Ok(Self {
             config_file: config_dir.join("config.jsonc"),
@@ -52,6 +54,7 @@ impl MiyuPaths {
             fish_hook_file,
             bash_hook_file,
             zsh_hook_file,
+            scripts_dir,
         })
     }
 
@@ -62,6 +65,7 @@ impl MiyuPaths {
         std::fs::create_dir_all(&self.cache_dir)?;
         std::fs::create_dir_all(&self.state_dir)?;
         std::fs::create_dir_all(&self.pictures_dir)?;
+        std::fs::create_dir_all(&self.scripts_dir)?;
         Ok(())
     }
 
@@ -116,6 +120,11 @@ impl MiyuPaths {
             "{}: {}",
             t("zsh_hook_file", "zsh hook 文件"),
             self.zsh_hook_file.display()
+        );
+        println!(
+            "{}: {}",
+            t("scripts_dir", "scripts 目录"),
+            self.scripts_dir.display()
         );
     }
 }

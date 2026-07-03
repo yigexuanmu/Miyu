@@ -32,6 +32,9 @@ pub struct Cli {
     #[arg(long)]
     pub plan: bool,
 
+    #[arg(long)]
+    pub stdout: bool,
+
     #[arg(long, hide = true)]
     pub shell_intercept: bool,
 
@@ -136,6 +139,12 @@ fn localize_top_args(command: clap::Command) -> clap::Command {
     command
         .mut_arg("plan", |arg| {
             arg.help(t("Run in read-only planning mode", "使用只读计划模式运行"))
+        })
+        .mut_arg("stdout", |arg| {
+            arg.help(t(
+                "Plain output mode (no colors, no TUI); pipe-friendly for stdout redirection",
+                "纯文本输出模式（无颜色、无 TUI）；适合管道重定向",
+            ))
         })
         .mut_arg("message", |arg| {
             arg.help(t(
@@ -621,7 +630,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
-            run_chat_with_options(&paths, join_message(args.message), None, false, mode).await
+            run_chat_with_options(&paths, join_message(args.message), None, cli.stdout, mode).await
         }
         Some(Command::Init) => run_init(&paths, InitKind::Explicit),
         Some(Command::Paths) => {
@@ -642,10 +651,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Reset(args)) => run_reset(&paths, args.scope.as_deref()),
         None => {
             let message = join_message(cli.message);
-            if message.is_empty() {
+            if message.is_empty() && io::stdin().is_terminal() {
                 run_repl(&paths, mode).await
             } else {
-                run_chat_with_options(&paths, message, None, false, mode).await
+                run_chat_with_options(&paths, message, None, cli.stdout, mode).await
             }
         }
     }
@@ -922,6 +931,7 @@ fn alarm_worker_paths(state_dir: PathBuf) -> MiyuPaths {
         fish_hook_file: PathBuf::new(),
         bash_hook_file: PathBuf::new(),
         zsh_hook_file: PathBuf::new(),
+        scripts_dir: PathBuf::new(),
     }
 }
 
@@ -1299,6 +1309,36 @@ fn drain_stdin() {
     let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
 }
 
+const STDIN_MAX_CHARS: usize = 50_000;
+const STDIN_TIMEOUT_SECS: u64 = 5;
+
+async fn append_stdin_if_piped(message: String) -> String {
+    if io::stdin().is_terminal() {
+        return message;
+    }
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(STDIN_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(|| {
+            let mut buf = String::new();
+            let mut stdin = std::io::stdin().lock();
+            let mut limited = (&mut stdin).take(STDIN_MAX_CHARS as u64);
+            limited.read_to_string(&mut buf).map(|_| buf)
+        }),
+    )
+    .await;
+
+    let stdin_content = match read_result {
+        Ok(Ok(Ok(content))) if !content.trim().is_empty() => content.trim().to_string(),
+        _ => return message,
+    };
+
+    if message.is_empty() {
+        stdin_content
+    } else {
+        format!("{message}\n\n---\n(stdin)\n{stdin_content}")
+    }
+}
+
 async fn run_chat_with_options(
     paths: &MiyuPaths,
     message: String,
@@ -1306,6 +1346,7 @@ async fn run_chat_with_options(
     plain: bool,
     mode: AgentMode,
 ) -> Result<()> {
+    let message = append_stdin_if_piped(message).await;
     if message.is_empty() {
         return run_repl(paths, mode).await;
     }
@@ -2301,6 +2342,7 @@ mod repl_input_tests {
             fish_hook_file: PathBuf::new(),
             bash_hook_file: PathBuf::new(),
             zsh_hook_file: PathBuf::new(),
+            scripts_dir: PathBuf::new(),
         };
         let state = StateStore::new(&paths).unwrap();
         state.append_message("user", "first").unwrap();
@@ -2589,8 +2631,9 @@ fn build_tool_registry(
         tools::ToolRegistry::new()
     };
     if mode == AgentMode::Yolo && config.tools.enabled && config.skills.enabled {
-        tools::register_skills(&mut registry, config, paths, true)?;
+        tools::register_skills(&mut registry, config, paths)?;
     }
+    tools::register_script_display_names(&registry);
     Ok(registry)
 }
 

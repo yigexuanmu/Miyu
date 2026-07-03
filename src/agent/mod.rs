@@ -8,6 +8,7 @@ use crate::memory::{EvictedTurn, MemoryStore};
 use crate::paths::MiyuPaths;
 use crate::state::StateStore;
 use crate::tools::{self, memes, ToolPermission, ToolRegistry};
+use std::sync::{Arc, Mutex};
 use anyhow::{bail, Result};
 use chrono::Local;
 use std::io::IsTerminal;
@@ -63,7 +64,7 @@ pub struct Agent {
     trim_batch_ratio: f32,
     tools_enabled: bool,
     max_tool_rounds: usize,
-    tools: ToolRegistry,
+    tools: Arc<Mutex<ToolRegistry>>,
     memory: MemoryStore,
     mode: AgentMode,
     config: AppConfig,
@@ -105,7 +106,7 @@ impl Agent {
             trim_batch_ratio: config.context.trim_batch_ratio,
             tools_enabled,
             max_tool_rounds,
-            tools,
+            tools: Arc::new(Mutex::new(tools)),
             memory,
             mode,
             config,
@@ -185,11 +186,6 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
-        let definitions = if self.tools_enabled {
-            self.tools.definitions()
-        } else {
-            Vec::new()
-        };
         let mut tool_round = 0usize;
         loop {
             if self.max_tool_rounds > 0 && tool_round >= self.max_tool_rounds {
@@ -209,9 +205,21 @@ impl Agent {
                 });
             }
             tool_round += 1;
+
+            {
+                let mut tools = self.tools.lock().unwrap();
+                tools::rescan_scripts(&mut tools, &self.paths);
+            }
+
+            let definitions = if self.tools_enabled {
+                self.tools.lock().unwrap().definitions()
+            } else {
+                Vec::new()
+            };
+
             let result = self
                 .client
-                .chat_stream(messages.clone(), definitions.clone(), |chunk| {
+                .chat_stream(messages.clone(), definitions, |chunk| {
                     on_event(AgentEvent::Chunk(chunk))
                 })
                 .await?;
@@ -228,13 +236,17 @@ impl Agent {
                     name: call.function.name.clone(),
                     arguments: call.function.arguments.clone(),
                 })?;
-                if self.mode == AgentMode::Plan
-                    && self.tools.permission(&call.function.name)? != ToolPermission::ReadOnly
                 {
-                    bail!(
-                        "Plan mode blocked non-read-only tool: {}",
-                        call.function.name
-                    );
+                    let tools = self.tools.lock().unwrap();
+                    if self.mode == AgentMode::Plan
+                        && tools.permission(&call.function.name)?
+                            != ToolPermission::ReadOnly
+                    {
+                        bail!(
+                            "Plan mode blocked non-read-only tool: {}",
+                            call.function.name
+                        );
+                    }
                 }
                 if call.function.name == "install_aur_package"
                     && used_tools.iter().any(|name| name == "review_aur_package")
@@ -249,11 +261,14 @@ impl Agent {
                     continue;
                 }
                 let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-                let tool_future = self.tools.call_with_progress(
-                    &call.function.name,
-                    &call.function.arguments,
-                    progress_tx,
-                );
+                let tool_future = {
+                    let tools = self.tools.lock().unwrap();
+                    tools.call_with_progress_future(
+                        &call.function.name,
+                        &call.function.arguments,
+                        progress_tx,
+                    )?
+                };
                 tokio::pin!(tool_future);
                 let output = loop {
                     tokio::select! {
@@ -327,6 +342,7 @@ fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<Stri
     let field = match tool_name {
         "linux_game_compatibility" => "final_report",
         "linux_input_method_diagnose" | "deep_diagnose" | "deep_research" => "final_answer",
+        "task" => "result",
         _ => return None,
     };
     serde_json::from_str::<serde_json::Value>(output)

@@ -1,12 +1,11 @@
 use super::{ToolRegistry, ToolSpec};
 use crate::config::AppConfig;
+use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::process::Command;
 
 pub fn skills_prompt(config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
     let mut entries = Vec::new();
@@ -50,7 +49,6 @@ pub fn register_skills(
     registry: &mut ToolRegistry,
     config: &AppConfig,
     paths: &MiyuPaths,
-    allow_command_execution: bool,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for skills_dir in skill_search_dirs(config, paths) {
@@ -75,12 +73,96 @@ pub fn register_skills(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            if name == "web-search" {
-                register_web_search(registry, skill_dir, allow_command_execution);
-            }
         }
     }
+    register_load_skill(registry, config, paths);
     Ok(())
+}
+
+fn register_load_skill(registry: &mut ToolRegistry, config: &AppConfig, paths: &MiyuPaths) {
+    let skill_dirs = skill_search_dirs(config, paths);
+    registry.register(ToolSpec::new(
+        "load_skill",
+        t(
+            "Load a specialized skill's full instructions and resources into the conversation. The skill name must match one of the available skills listed in the system prompt.",
+            "加载指定技能的完整指令和资源到当前对话。技能名称必须匹配系统提示中列出的可用技能之一。",
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": t("The name of the skill from the available skills list.", "可用技能列表中的技能名称。")
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let skill_dirs = skill_dirs.clone();
+            async move { load_skill(args, &skill_dirs) }
+        },
+    ));
+}
+
+fn load_skill(args: Value, skill_dirs: &[PathBuf]) -> Result<String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        anyhow::bail!("skill name is required");
+    }
+    for dir in skill_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let skill_dir = entry.path();
+            let skill_file = skill_dir.join("SKILL.md");
+            if !skill_file.is_file() {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&skill_file)?;
+            let skill_name = skill_name(&raw, &entry.file_name().to_string_lossy());
+            if skill_name != name {
+                continue;
+            }
+            let body = strip_frontmatter(&raw);
+            let base_dir = skill_dir.display().to_string();
+            let mut files = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&skill_dir) {
+                for file_entry in entries.flatten() {
+                    let fname = file_entry.file_name().to_string_lossy().to_string();
+                    if fname == "SKILL.md" || fname.starts_with('.') {
+                        continue;
+                    }
+                    files.push(file_entry.path().display().to_string());
+                }
+            }
+            files.sort();
+            let files_xml = if files.is_empty() {
+                String::new()
+            } else {
+                let items = files
+                    .iter()
+                    .map(|f| format!("<file>{f}</file>"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("\n<skill_files>\n{items}\n</skill_files>")
+            };
+            return Ok(format!(
+                "<skill_content name=\"{name}\">\n# Skill: {name}\n\n{body}\n\nBase directory for this skill: {base_dir}\nRelative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.\n{files_xml}\n</skill_content>"
+            ));
+        }
+    }
+    anyhow::bail!("skill not found: {name}");
 }
 
 fn skill_search_dirs(config: &AppConfig, paths: &MiyuPaths) -> Vec<PathBuf> {
@@ -94,78 +176,6 @@ fn skill_search_dirs(config: &AppConfig, paths: &MiyuPaths) -> Vec<PathBuf> {
 
 fn skill_name(raw: &str, fallback: &str) -> String {
     frontmatter_value(raw, "name").unwrap_or_else(|| fallback.to_string())
-}
-
-fn register_web_search(
-    registry: &mut ToolRegistry,
-    skill_dir: PathBuf,
-    allow_command_execution: bool,
-) {
-    let script = skill_dir.join("scripts/web-search.py");
-    registry.register(ToolSpec::new(
-        "web_search",
-        "Search the web for current or real-time information. Use this when the answer needs online lookup, recent facts, news, or verification. Return search results with URLs for verification when needed.",
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search query." },
-                "max_results": { "type": "integer", "description": "Maximum results to return.", "minimum": 1, "maximum": 10 },
-                "provider": { "type": "string", "enum": ["auto", "tavily", "firecrawl", "anysearch", "searxng"], "description": "Search provider." }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        }),
-        move |args| {
-            let script = script.clone();
-            async move { run_web_search(script, allow_command_execution, args).await }
-        },
-    ));
-}
-
-async fn run_web_search(
-    script: PathBuf,
-    allow_command_execution: bool,
-    args: Value,
-) -> Result<String> {
-    if !allow_command_execution {
-        bail!("skill command execution is disabled; set skills.allow_command_execution=true in config.jsonc to enable this tool");
-    }
-    if !script.is_file() {
-        bail!("web-search skill script not found: {}", script.display());
-    }
-    let query = args
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    if query.is_empty() {
-        bail!("web_search requires a non-empty query");
-    }
-    let max_results = args
-        .get("max_results")
-        .and_then(Value::as_u64)
-        .unwrap_or(5)
-        .clamp(1, 10)
-        .to_string();
-    let provider = args
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("auto");
-    let output = Command::new("python3")
-        .arg(script)
-        .arg(query)
-        .arg("-n")
-        .arg(max_results)
-        .arg("-p")
-        .arg(provider)
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("web_search failed: {}", stderr.trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn frontmatter_value(raw: &str, key: &str) -> Option<String> {
@@ -226,6 +236,7 @@ mod tests {
             fish_hook_file: root.join("fish/miyu.fish"),
             bash_hook_file: root.join("shell/bash-hook.sh"),
             zsh_hook_file: root.join("shell/zsh-hook.zsh"),
+            scripts_dir: root.join("config/scripts"),
         }
     }
 
