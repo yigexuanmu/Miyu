@@ -156,6 +156,8 @@ impl StreamRenderer {
             if chunk.kind == ChatStreamKind::Content {
                 self.finalize_reasoning_summary()?;
                 self.finalize_tools_summary()?;
+            } else if chunk.kind == ChatStreamKind::Reasoning {
+                self.finalize_tools_summary()?;
             }
             self.switch_mode(chunk.kind)?;
         }
@@ -557,6 +559,7 @@ impl StreamRenderer {
 
     fn finalize_tools_summary(&mut self) -> Result<()> {
         if self.tool_call_mode == ToolCallDisplayMode::Summary && !self.tool_stats.is_empty() {
+            execute!(io::stdout(), ResetColor)?;
             if self.summary_line_active {
                 let mut stdout = io::stdout();
                 self.clear_summary_lines()?;
