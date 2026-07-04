@@ -154,27 +154,6 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
             }
         },
     ));
-    registry.register(ToolSpec::new(
-        "recent_meme",
-        t(
-            "Get the most recent meme automatically sent for the current persona/library.",
-            "查询当前人格/表情库最近一次自动发送的表情。",
-        ),
-        json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        {
-            let config = config.clone();
-            let paths = paths.clone();
-            move |_| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move { recent_meme(&config, &paths).await }
-            }
-        },
-    ));
     registry.register(
         ToolSpec::new(
             "add_meme",
@@ -333,15 +312,6 @@ async fn show_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result
     .to_string())
 }
 
-async fn recent_meme(config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
-    let state = load_auto_meme_state(config, paths)?;
-    Ok(match state.last {
-        Some(event) => json!({ "success": true, "recent": event }).to_string(),
-        None => json!({ "success": false, "message": "当前人格/表情库还没有自动发送过表情" })
-            .to_string(),
-    })
-}
-
 pub(crate) async fn plan_auto_meme_before_reply(
     config: &AppConfig,
     paths: &MiyuPaths,
@@ -391,7 +361,7 @@ pub(crate) async fn plan_auto_meme_before_reply(
         sent_at: Utc::now().to_rfc3339(),
     };
     let reminder = format!(
-        "<system-reminder>\n本轮回复发送后，程序会自动发送一张表情包。你在回复文字时应该自然地知道这件事，让语气和表情一致，但不要直白说“我将发送表情包”。\n计划发送表情：{}\n表情描述：{}\n适用场景：{}\n选择原因：{}\n</system-reminder>",
+        "<system-reminder>\n本轮你的回复文字发送后，程序会自动代替你发送一张表情包。你在组织回复时可以自然地配合这张表情的语气；表情发出后应视为你自己发出的内容，而不是另一个程序发出的内容。不要直白说“我将发送表情包”，也不要暗示表情包已经提前决定发送。\n计划发送表情：{}\n表情描述：{}\n适用场景：{}\n选择原因：{}\n</system-reminder>",
         display_name(&event.name),
         event.description,
         event.usage,
@@ -430,18 +400,8 @@ pub(crate) fn last_auto_meme_reminder(
     config: &AppConfig,
     paths: &MiyuPaths,
 ) -> Result<Option<String>> {
-    let Some(event) = load_auto_meme_state(config, paths)?.last else {
-        return Ok(None);
-    };
-    Ok(Some(format!(
-        "<system-reminder>\n上一轮回复文字发送后，程序自动补发了一张表情包。你需要自然地记得自己已经发过这张表情；如果用户提到“刚才那张/你发的表情”，按这个信息回答，不要说不知道。\n表情库：{}\n表情名：{}\n表情描述：{}\n适用场景：{}\n发送原因：{}\n发送时间：{}\n</system-reminder>",
-        event.library,
-        display_name(&event.name),
-        event.description,
-        event.usage,
-        event.reason,
-        event.sent_at,
-    )))
+    let _ = (config, paths);
+    Ok(None)
 }
 
 async fn add_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
@@ -665,7 +625,7 @@ async fn decide_auto_send(
         })
         .collect::<Vec<_>>();
     let prompt = format!(
-        "你在 Miyu 回复前决定本轮是否应该搭配一张表情包。概率只控制触发频率；这里需要判断候选表情和用户消息、上下文语气的相关程度。请根据用户消息的语气、场景、关系边界和候选表情的 usage/avoid 决定。严肃、道歉、群管理、技术排障、长篇解释、用户明显在求助时不要发表情。轻松闲聊、调侃、打招呼、夸奖、吐槽、玩梗、情绪回应时可以发。只能从候选表情里选。confidence 表示所选表情与本轮消息/上下文的相关程度，0.0 到 1.0。只返回严格 JSON：{{\"send\": false, \"id\": \"\", \"confidence\": 0.0, \"reason\": \"\"}}\n\n用户消息：{}\n\n候选表情：{}",
+        "你在主智能体回复前决定本轮是否应该搭配一张表情包。概率只控制触发频率；这里需要判断候选表情和用户消息的相关程度。请根据用户消息的语气、场景、关系边界和候选表情的 usage/avoid 决定。严肃、道歉、群管理、技术排障、长篇解释、用户明显在求助时不要发表情。轻松闲聊、调侃、打招呼、夸奖、吐槽、玩梗、情绪回应时可以发。只能从候选表情里选。confidence 表示所选表情与本轮用户消息的相关程度，0.0 到 1.0。只返回严格 JSON：{{\"send\": false, \"id\": \"\", \"confidence\": 0.0, \"reason\": \"\"}}\n\n用户消息：{}\n\n候选表情：{}",
         user_message.chars().take(1000).collect::<String>(),
         serde_json::to_string(&catalog)?,
     );
@@ -784,6 +744,7 @@ fn selected_library(args: &Value, config: &AppConfig) -> String {
         })
 }
 
+#[allow(dead_code)]
 fn load_auto_meme_state(config: &AppConfig, paths: &MiyuPaths) -> Result<AutoMemeState> {
     let path = auto_meme_state_path(config, paths);
     if !path.is_file() {
