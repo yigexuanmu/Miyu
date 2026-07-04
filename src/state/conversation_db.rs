@@ -179,6 +179,34 @@ impl ConversationDb {
         Ok(turns)
     }
 
+    pub fn load_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
+                    assistant_reasoning, assistant_timestamp, status, tool_reports
+             FROM turns WHERE turn_id != ?1 ORDER BY seq ASC",
+        )?;
+        let turns = stmt
+            .query_map(params![exclude_turn_id], |row| {
+                let tool_reports_json: String = row.get(8)?;
+                let tool_reports: Vec<String> =
+                    serde_json::from_str(&tool_reports_json).unwrap_or_default();
+                Ok(Turn {
+                    turn_id: row.get(0)?,
+                    seq: row.get(1)?,
+                    user_content: row.get(2)?,
+                    user_timestamp: row.get(3)?,
+                    assistant_content: row.get(4)?,
+                    assistant_reasoning: row.get(5)?,
+                    assistant_timestamp: row.get(6)?,
+                    status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
+                    tool_reports,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(turns)
+    }
+
     #[allow(dead_code)]
     pub fn load_turns_for_context(&self) -> Result<Vec<Turn>> {
         self.load_turns()
@@ -270,6 +298,7 @@ impl ConversationDb {
         Ok(count > 0)
     }
 
+    #[allow(dead_code)]
     pub fn running_turn_summaries(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -277,6 +306,17 @@ impl ConversationDb {
         )?;
         let summaries = stmt
             .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(summaries)
+    }
+
+    pub fn running_turn_summaries_excluding(&self, exclude_turn_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_content FROM turns WHERE status = 'running' AND turn_id != ?1 ORDER BY seq ASC",
+        )?;
+        let summaries = stmt
+            .query_map(params![exclude_turn_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(summaries)
     }

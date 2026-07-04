@@ -236,7 +236,7 @@ impl Agent {
         );
         self.state.start_turn(&turn_id, &input)?;
         let guard = PendingTurnGuard::new(self.state.clone(), turn_id.clone());
-        let mut messages = self.chat_messages()?;
+        let mut messages = self.chat_messages(&turn_id, &input)?;
         if !binary_images.is_empty() && self.current_model_supports_vision() {
             if let Some(last) = messages.last_mut() {
                 if last.role == "user" {
@@ -593,13 +593,14 @@ impl Agent {
         }
     }
 
-    fn chat_messages(&self) -> Result<Vec<ChatMessage>> {
+    fn chat_messages(&self, current_turn_id: &str, current_input: &str) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
         if let Some(summary) = memes::last_auto_meme_reminder(&self.config, &self.paths)? {
             messages.push(ChatMessage::system(summary));
         }
-        let turns = self.state.load_turns()?;
-        let running_summaries: Vec<String> = self.state.running_turn_summaries()?;
+        let turns = self.state.load_turns_excluding(current_turn_id)?;
+        let running_summaries: Vec<String> =
+            self.state.running_turn_summaries_excluding(current_turn_id)?;
         for turn in &turns {
             messages.push(ChatMessage::plain("user", &turn.user_content));
             messages.push(ChatMessage::plain("assistant", &turn.assistant_content));
@@ -611,6 +612,7 @@ impl Agent {
             let hint = format_parallel_focus_hint(&running_summaries);
             messages.push(ChatMessage::system(hint));
         }
+        messages.push(ChatMessage::plain("user", current_input));
         Ok(messages)
     }
 }

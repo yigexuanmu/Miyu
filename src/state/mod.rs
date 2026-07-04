@@ -106,8 +106,13 @@ impl StateStore {
         Ok(turns_to_entries(turns))
     }
 
+    #[allow(dead_code)]
     pub fn load_turns(&self) -> Result<Vec<Turn>> {
         self.conv_db.load_turns()
+    }
+
+    pub fn load_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
+        self.conv_db.load_turns_excluding(exclude_turn_id)
     }
 
     pub fn trim_conversation_to_budget(
@@ -150,8 +155,16 @@ impl StateStore {
         self.conv_db.has_running_turns()
     }
 
+    #[allow(dead_code)]
     pub fn running_turn_summaries(&self) -> Result<Vec<String>> {
         self.conv_db.running_turn_summaries()
+    }
+
+    pub fn running_turn_summaries_excluding(
+        &self,
+        exclude_turn_id: &str,
+    ) -> Result<Vec<String>> {
+        self.conv_db.running_turn_summaries_excluding(exclude_turn_id)
     }
 
     #[allow(dead_code)]
