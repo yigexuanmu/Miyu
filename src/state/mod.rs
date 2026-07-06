@@ -59,8 +59,8 @@ impl StateStore {
         &self.conv_db
     }
 
-    pub fn start_turn(&self, turn_id: &str, user_content: &str) -> Result<()> {
-        self.conv_db.start_turn(turn_id, user_content)
+    pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
+        self.conv_db.start_turn(turn_id, user_content, owner_pid)
     }
 
     pub fn complete_turn(
@@ -282,7 +282,7 @@ mod tests {
         })
         .unwrap();
 
-        store.start_turn("turn_1", "hello").unwrap();
+        store.start_turn("turn_1", "hello", 999999).unwrap();
         let turns = store.load_turns().unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Running);
@@ -316,7 +316,7 @@ mod tests {
         })
         .unwrap();
 
-        store.start_turn("turn_1", "do something").unwrap();
+        store.start_turn("turn_1", "do something", 999999).unwrap();
         store.interrupt_turn("turn_1").unwrap();
         let turns = store.load_turns().unwrap();
         assert_eq!(turns[0].status, TurnStatus::Interrupted);
@@ -343,8 +343,8 @@ mod tests {
         })
         .unwrap();
 
-        store.start_turn("turn_1", "task a").unwrap();
-        store.start_turn("turn_2", "task b").unwrap();
+        store.start_turn("turn_1", "task a", 999999).unwrap();
+        store.start_turn("turn_2", "task b", 999999).unwrap();
         assert!(store.has_running_turns().unwrap());
 
         let recovered = store.recover_stale_turns().unwrap();
@@ -375,9 +375,9 @@ mod tests {
         })
         .unwrap();
 
-        store.start_turn("turn_1", "hello").unwrap();
+        store.start_turn("turn_1", "hello", 999999).unwrap();
         store.complete_turn("turn_1", "hi", None).unwrap();
-        store.start_turn("turn_2", "bye").unwrap();
+        store.start_turn("turn_2", "bye", 999999).unwrap();
         store.complete_turn("turn_2", "goodbye", None).unwrap();
 
         let (removed, prompt) = store.undo_last_turn().unwrap();
@@ -387,5 +387,53 @@ mod tests {
         let turns = store.load_turns().unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].turn_id, "turn_1");
+    }
+
+    #[test]
+    fn recover_stale_skips_alive_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let make_paths = || MiyuPaths {
+            config_dir: temp.path().join("config"),
+            config_file: temp.path().join("config/config.jsonc"),
+            secrets_file: temp.path().join("config/secrets.jsonc"),
+            skills_dir: temp.path().join("config/skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish/miyu.fish"),
+            bash_hook_file: temp.path().join("shell/bash-hook.sh"),
+            zsh_hook_file: temp.path().join("shell/zsh-hook.zsh"),
+            scripts_dir: temp.path().join("config/scripts"),
+            system_scripts_dir: PathBuf::new(),
+        };
+
+        let store = StateStore::new(&make_paths()).unwrap();
+
+        // 模拟终端1: 用当前进程 PID (活着)
+        let current_pid = std::process::id();
+        store.start_turn("turn_1", "终端1的prompt", current_pid).unwrap();
+
+        // 模拟终端1还有一个死掉的 turn
+        store.start_turn("turn_dead", "孤儿turn", 999999).unwrap();
+
+        // 模拟终端2启动: recover_stale_turns
+        let recovered = store.recover_stale_turns().unwrap();
+
+        // 只恢复死掉的 turn, 不恢复活着的
+        assert_eq!(recovered, 1);
+
+        let turns = store.load_turns().unwrap();
+        let turn1 = turns.iter().find(|t| t.turn_id == "turn_1").unwrap();
+        assert_eq!(turn1.status, TurnStatus::Running);
+        assert_eq!(turn1.assistant_content, pending_placeholder());
+
+        let dead = turns.iter().find(|t| t.turn_id == "turn_dead").unwrap();
+        assert_eq!(dead.status, TurnStatus::Interrupted);
+
+        // 终端2的 running_turn_summaries_excluding 应该能看到终端1的 turn
+        let running = store.running_turn_summaries_excluding("turn_2").unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0], "终端1的prompt");
     }
 }
