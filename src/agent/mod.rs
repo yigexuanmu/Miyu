@@ -228,7 +228,7 @@ impl Agent {
                 .unwrap_or(0),
             rand::random::<u16>()
         );
-        self.state.start_turn(&turn_id, &input)?;
+        self.state.start_turn(&turn_id, &input, std::process::id())?;
         let guard = PendingTurnGuard::new(self.state.clone(), turn_id.clone());
         let mut messages = self.chat_messages(&turn_id, &input)?;
         if !binary_images.is_empty() && self.current_model_supports_vision() {
@@ -678,18 +678,12 @@ impl Agent {
             messages.push(ChatMessage::system(summary));
         }
         let turns = self.state.load_turns_excluding(current_turn_id)?;
-        let running_summaries: Vec<String> =
-            self.state.running_turn_summaries_excluding(current_turn_id)?;
         for turn in &turns {
             messages.push(ChatMessage::plain("user", &turn.user_content));
             messages.push(ChatMessage::plain("assistant", &turn.assistant_content));
             for report in &turn.tool_reports {
                 messages.push(ChatMessage::plain("assistant", report));
             }
-        }
-        if !running_summaries.is_empty() {
-            let hint = format_parallel_focus_hint(&running_summaries);
-            messages.push(ChatMessage::system(hint));
         }
         messages.push(ChatMessage::plain("user", current_input));
         Ok(messages)
@@ -829,26 +823,6 @@ fn strip_tagged_sections(mut text: String, tag: &str) -> String {
         text.replace_range(start..end, "");
     }
     text
-}
-
-fn format_parallel_focus_hint(running_summaries: &[String]) -> String {
-    let list = running_summaries
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("  {}. {}", i + 1, truncate(s, 80)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "<parallel-focus>\n你当前还有这些正在由另一条对话线处理的注意力焦点，它们尚未完成：\n{list}\n不要替这些轮次继续生成最终回答；请根据当前用户输入继续。\n</parallel-focus>"
-    )
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", s.chars().take(max.saturating_sub(3)).collect::<String>())
-    }
 }
 
 #[cfg(test)]

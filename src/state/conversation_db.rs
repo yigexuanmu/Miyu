@@ -4,9 +4,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
-const PENDING_PLACEHOLDER: &str = "此轮响应正在由另一条对话线处理...";
+const PENDING_PLACEHOLDER: &str = "<system>此轮响应正在由另一个进程处理中，请勿接手此轮对话，只需回应当前用户的输入。</system>";
 const INTERRUPTED_TEXT: &str =
-    "此轮响应被中断，但是除非用户重新要求否则不要重新执行此轮对话。";
+    "<system>此轮响应被中断，除非用户重新要求否则不要重新执行此轮对话。</system>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStatus {
@@ -46,6 +46,7 @@ pub struct Turn {
     pub assistant_timestamp: Option<String>,
     pub status: TurnStatus,
     pub tool_reports: Vec<String>,
+    pub owner_pid: Option<i64>,
 }
 
 pub struct ConversationDb {
@@ -85,19 +86,20 @@ impl ConversationDb {
             CREATE INDEX IF NOT EXISTS idx_turns_seq ON turns(seq);
             CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status);",
         )?;
+        add_column_if_missing(&conn, "turns", "owner_pid", "INTEGER")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    pub fn start_turn(&self, turn_id: &str, user_content: &str) -> Result<()> {
+    pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let seq = self.next_seq_locked(&conn)?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
-            params![turn_id, seq, user_content, now, PENDING_PLACEHOLDER],
+            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status, owner_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+            params![turn_id, seq, user_content, now, PENDING_PLACEHOLDER, owner_pid as i64],
         )?;
         Ok(())
     }
@@ -155,26 +157,11 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports
+                    assistant_reasoning, assistant_timestamp, status, tool_reports, owner_pid
              FROM turns ORDER BY seq ASC",
         )?;
         let turns = stmt
-            .query_map([], |row| {
-                let tool_reports_json: String = row.get(8)?;
-                let tool_reports: Vec<String> =
-                    serde_json::from_str(&tool_reports_json).unwrap_or_default();
-                Ok(Turn {
-                    turn_id: row.get(0)?,
-                    seq: row.get(1)?,
-                    user_content: row.get(2)?,
-                    user_timestamp: row.get(3)?,
-                    assistant_content: row.get(4)?,
-                    assistant_reasoning: row.get(5)?,
-                    assistant_timestamp: row.get(6)?,
-                    status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
-                    tool_reports,
-                })
-            })?
+            .query_map([], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(turns)
     }
@@ -183,26 +170,11 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports
+                    assistant_reasoning, assistant_timestamp, status, tool_reports, owner_pid
              FROM turns WHERE turn_id != ?1 ORDER BY seq ASC",
         )?;
         let turns = stmt
-            .query_map(params![exclude_turn_id], |row| {
-                let tool_reports_json: String = row.get(8)?;
-                let tool_reports: Vec<String> =
-                    serde_json::from_str(&tool_reports_json).unwrap_or_default();
-                Ok(Turn {
-                    turn_id: row.get(0)?,
-                    seq: row.get(1)?,
-                    user_content: row.get(2)?,
-                    user_timestamp: row.get(3)?,
-                    assistant_content: row.get(4)?,
-                    assistant_reasoning: row.get(5)?,
-                    assistant_timestamp: row.get(6)?,
-                    status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
-                    tool_reports,
-                })
-            })?
+            .query_map(params![exclude_turn_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(turns)
     }
@@ -229,26 +201,11 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports
+                    assistant_reasoning, assistant_timestamp, status, tool_reports, owner_pid
              FROM turns ORDER BY seq ASC LIMIT ?1",
         )?;
         let to_remove: Vec<Turn> = stmt
-            .query_map(params![count as i64], |row| {
-                let tool_reports_json: String = row.get(8)?;
-                let tool_reports: Vec<String> =
-                    serde_json::from_str(&tool_reports_json).unwrap_or_default();
-                Ok(Turn {
-                    turn_id: row.get(0)?,
-                    seq: row.get(1)?,
-                    user_content: row.get(2)?,
-                    user_timestamp: row.get(3)?,
-                    assistant_content: row.get(4)?,
-                    assistant_reasoning: row.get(5)?,
-                    assistant_timestamp: row.get(6)?,
-                    status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
-                    tool_reports,
-                })
-            })?
+            .query_map(params![count as i64], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         for turn in &to_remove {
@@ -323,12 +280,36 @@ impl ConversationDb {
 
     pub fn recover_stale_running_turns(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        let affected = conn.execute(
-            "UPDATE turns SET assistant_content = ?1, assistant_timestamp = ?2, status = 'interrupted'
-             WHERE status = 'running'",
-            params![INTERRUPTED_TEXT, now],
+        let mut stmt = conn.prepare(
+            "SELECT turn_id, owner_pid FROM turns WHERE status = 'running'",
         )?;
+        let stale_turn_ids: Vec<String> = stmt
+            .query_map([], |row| {
+                let turn_id: String = row.get(0)?;
+                let owner_pid: Option<i64> = row.get(1)?;
+                Ok((turn_id, owner_pid))
+            })?
+            .filter_map(|row| {
+                let (turn_id, owner_pid) = row.ok()?;
+                let alive = owner_pid
+                    .map(|pid| crate::alarm::process_exists(pid as u32))
+                    .unwrap_or(false);
+                if alive { None } else { Some(turn_id) }
+            })
+            .collect();
+        drop(stmt);
+        if stale_turn_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut affected = 0usize;
+        for turn_id in &stale_turn_ids {
+            affected += conn.execute(
+                "UPDATE turns SET assistant_content = ?1, assistant_timestamp = ?2, status = 'interrupted'
+                 WHERE turn_id = ?3 AND status = 'running'",
+                params![INTERRUPTED_TEXT, now, turn_id],
+            )?;
+        }
         Ok(affected)
     }
 
@@ -454,4 +435,37 @@ pub fn pending_placeholder() -> &'static str {
 #[allow(dead_code)]
 pub fn interrupted_text() -> &'static str {
     INTERRUPTED_TEXT
+}
+
+fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
+    let tool_reports_json: String = row.get(8)?;
+    let tool_reports: Vec<String> =
+        serde_json::from_str(&tool_reports_json).unwrap_or_default();
+    Ok(Turn {
+        turn_id: row.get(0)?,
+        seq: row.get(1)?,
+        user_content: row.get(2)?,
+        user_timestamp: row.get(3)?,
+        assistant_content: row.get(4)?,
+        assistant_reasoning: row.get(5)?,
+        assistant_timestamp: row.get(6)?,
+        status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
+        tool_reports,
+        owner_pid: row.get(9)?,
+    })
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
