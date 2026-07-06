@@ -1685,7 +1685,7 @@ fn edit_provider_form(
             provider.api_key.clone().unwrap_or_default(),
         ),
         Field::new("当前模型", provider.default_model.clone()),
-        Field::new("模型上下文窗口 (tokens, 0=禁用)", current_context_window.to_string()),
+        Field::new("模型上下文窗口 (tokens, 0=自动)", current_context_window.to_string()),
         Field::new("超时秒数", provider.timeout_seconds.to_string()),
         Field::new("Temperature", provider.temperature.to_string()),
     ];
@@ -1736,7 +1736,7 @@ fn edit_model_form(
     let mut fields = vec![
         Field::boolean("激活模型", active),
         Field::boolean("设为当前模型", current),
-        Field::new("模型上下文窗口 (tokens, 0=禁用)", context_window.to_string()),
+        Field::new("模型上下文窗口 (tokens, 0=自动)", context_window.to_string()),
     ];
     if !run_form(stdout, " EDIT MODEL ", &mut fields)? {
         return Ok(false);
@@ -1791,10 +1791,6 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
         Field::boolean("工具名可读显示", config.display.readable_tool_names),
         Field::new("上下文到达上限后", config.context.on_overflow.clone())
             .choices(&["pop", "compact"]),
-        Field::new(
-            "compact 保留最近几轮",
-            config.context.compact_keep_turns.to_string(),
-        ),
     ];
     if run_form(stdout, " GLOBAL SETTINGS ", &mut fields)? {
         config.tools.enabled = parse_bool_field(&fields[0].value)?;
@@ -1805,7 +1801,6 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
         config.display.tool_calls = fields[5].value.trim().to_string();
         config.display.readable_tool_names = parse_bool_field(&fields[6].value)?;
         config.context.on_overflow = fields[7].value.trim().to_string();
-        config.context.compact_keep_turns = fields[8].value.trim().parse::<usize>()?;
     }
     Ok(())
 }

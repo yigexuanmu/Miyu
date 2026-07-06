@@ -157,8 +157,6 @@ pub struct ContextConfig {
     pub trim_batch_ratio: f32,
     #[serde(default = "default_on_overflow")]
     pub on_overflow: String,
-    #[serde(default = "default_compact_keep_turns")]
-    pub compact_keep_turns: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,7 +813,6 @@ impl Default for ContextConfig {
             trim_at_ratio: default_trim_at_ratio(),
             trim_batch_ratio: default_trim_batch_ratio(),
             on_overflow: default_on_overflow(),
-            compact_keep_turns: default_compact_keep_turns(),
         }
     }
 }
@@ -1060,9 +1057,6 @@ impl AppConfig {
             "pop" | "compact" => {}
             value => bail!("context.on_overflow must be 'pop' or 'compact', got: {value}"),
         }
-        if self.context.compact_keep_turns == 0 {
-            bail!("context.compact_keep_turns must be greater than 0");
-        }
         if self.plugins.print_image.width_percent == 0
             || self.plugins.print_image.width_percent > 100
         {
@@ -1177,10 +1171,16 @@ impl AppConfig {
 
     pub fn active_context_window(&self) -> Result<Option<usize>> {
         let provider = self.provider(None)?;
-        Ok(provider
+        let model = &provider.default_model;
+        if let Some(window) = provider
             .model_context_window
-            .get(&provider.default_model)
-            .copied())
+            .get(model)
+            .copied()
+            .filter(|&w| w > 0)
+        {
+            return Ok(Some(window));
+        }
+        Ok(crate::models_cache::context_window(model).map(|w| w as usize))
     }
 
     pub fn system_prompt(&self, paths: &MiyuPaths) -> Result<String> {
@@ -1655,10 +1655,6 @@ fn default_trim_batch_ratio() -> f32 {
 
 fn default_on_overflow() -> String {
     "pop".to_string()
-}
-
-fn default_compact_keep_turns() -> usize {
-    2
 }
 
 #[cfg(unix)]

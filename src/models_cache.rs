@@ -21,6 +21,8 @@ struct ApiProvider {
 struct ApiModel {
     #[serde(default)]
     modalities: Option<ApiModalities>,
+    #[serde(default)]
+    limit: Option<ApiLimit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,8 +31,20 @@ struct ApiModalities {
     input: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiLimit {
+    #[serde(default)]
+    context: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub input_modalities: Vec<String>,
+    pub context_window: Option<u64>,
+}
+
 struct Cache {
-    data: HashMap<String, HashMap<String, Vec<String>>>,
+    data: HashMap<String, HashMap<String, ModelInfo>>,
 }
 
 static CACHE: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
@@ -58,7 +72,7 @@ fn is_fresh(path: &PathBuf) -> bool {
     elapsed.as_secs() < TTL_SECS
 }
 
-fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, HashMap<String, ModelInfo>>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read models cache: {}", path.display()))?;
     let api: ApiResponse = serde_json::from_str(&text).context("failed to parse models cache")?;
@@ -70,14 +84,17 @@ fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, HashMap<String, Vec<
                 .modalities
                 .map(|m| m.input)
                 .unwrap_or_default();
-            models.insert(model_id, input);
+            models.insert(model_id, ModelInfo {
+                input_modalities: input,
+                context_window: model.limit.and_then(|l| l.context),
+            });
         }
         result.insert(provider_id, models);
     }
     Ok(result)
 }
 
-fn fetch_and_cache(path: &PathBuf) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+fn fetch_and_cache(path: &PathBuf) -> Result<HashMap<String, HashMap<String, ModelInfo>>> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
@@ -127,8 +144,19 @@ pub fn supports_vision(provider_id: &str, model_id: &str) -> Option<bool> {
     let lock = cache_lock().lock().unwrap();
     let cache = lock.as_ref()?;
     let provider = cache.data.get(provider_id)?;
-    let input = provider.get(model_id)?;
-    Some(input.iter().any(|m| m == "image"))
+    let info = provider.get(model_id)?;
+    Some(info.input_modalities.iter().any(|m| m == "image"))
+}
+
+pub fn context_window(model_id: &str) -> Option<u64> {
+    let lock = cache_lock().lock().unwrap();
+    let cache = lock.as_ref()?;
+    for provider in cache.data.values() {
+        if let Some(info) = provider.get(model_id) {
+            return info.context_window;
+        }
+    }
+    None
 }
 
 #[allow(dead_code)]

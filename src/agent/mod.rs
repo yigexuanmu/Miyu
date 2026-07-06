@@ -126,7 +126,6 @@ pub struct Agent {
     paths: MiyuPaths,
     context_window: Option<usize>,
     on_overflow: String,
-    compact_keep_turns: usize,
 }
 
 impl Agent {
@@ -150,7 +149,6 @@ impl Agent {
         memory.init()?;
         let context_window = config.active_context_window()?;
         let on_overflow = config.context.on_overflow.clone();
-        let compact_keep_turns = config.context.compact_keep_turns;
         Ok(Self {
             state,
             client,
@@ -166,7 +164,6 @@ impl Agent {
             paths: paths.clone(),
             context_window,
             on_overflow,
-            compact_keep_turns,
         })
     }
 
@@ -380,13 +377,16 @@ impl Agent {
         }
         match self.on_overflow.as_str() {
             "compact" => {
+                let visible_count = self.state.load_visible_turns()?.len();
+                if visible_count == 0 {
+                    return Ok(());
+                }
                 on_event(AgentEvent::CompactStart)?;
                 let compactor = compact::Compactor::new(
                     self.client.clone(),
                     self.state.clone(),
                     self.context_window.unwrap(),
                     check.reserved_tokens,
-                    self.compact_keep_turns,
                 );
                 let mut on_chunk = |chunk: ChatStreamChunk| {
                     on_event(AgentEvent::CompactChunk(chunk))

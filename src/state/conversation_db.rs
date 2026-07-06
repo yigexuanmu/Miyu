@@ -216,7 +216,7 @@ impl ConversationDb {
     pub fn hide_turns_before_seq(&self, seq: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let affected = conn.execute(
-            "UPDATE turns SET hidden = 1 WHERE seq < ?1 AND is_summary = 0",
+            "UPDATE turns SET hidden = 1 WHERE seq <= ?1",
             params![seq],
         )?;
         Ok(affected)

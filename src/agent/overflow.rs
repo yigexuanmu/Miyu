@@ -1,7 +1,8 @@
 use crate::llm::{ChatContent, ChatMessage, Usage};
 
 const CHARS_PER_TOKEN: usize = 4;
-const DEFAULT_RESERVED_TOKENS: usize = 20_000;
+const RESERVED_RATIO: f32 = 0.1;
+const MIN_RESERVED_TOKENS: usize = 4096;
 
 pub struct OverflowCheck {
     pub context_window: Option<usize>,
@@ -15,9 +16,14 @@ impl OverflowCheck {
         trim_at_ratio: f32,
         reserved_tokens: Option<usize>,
     ) -> Self {
+        let reserved_tokens = reserved_tokens.unwrap_or_else(|| {
+            context_window
+                .map(|w| ((w as f32 * RESERVED_RATIO) as usize).max(MIN_RESERVED_TOKENS))
+                .unwrap_or(MIN_RESERVED_TOKENS)
+        });
         Self {
             context_window,
-            reserved_tokens: reserved_tokens.unwrap_or(DEFAULT_RESERVED_TOKENS),
+            reserved_tokens,
             trim_at_ratio,
         }
     }

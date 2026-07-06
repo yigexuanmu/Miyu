@@ -13,7 +13,6 @@ pub struct Compactor {
     state: StateStore,
     context_window: usize,
     reserved_tokens: usize,
-    keep_turns: usize,
 }
 
 impl Compactor {
@@ -22,28 +21,25 @@ impl Compactor {
         state: StateStore,
         context_window: usize,
         reserved_tokens: usize,
-        keep_turns: usize,
     ) -> Self {
         Self {
             client,
             state,
             context_window,
             reserved_tokens,
-            keep_turns,
         }
     }
 
-    pub async fn perform_compact<F>(&self, on_chunk: &mut F) -> Result<String>
+    pub async fn perform_compact<F>(&self, on_chunk: &mut F) -> Result<Option<String>>
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
         let turns = self.state.load_visible_turns()?;
-        if turns.len() <= self.keep_turns {
-            return Ok(String::new());
+        if turns.is_empty() {
+            return Ok(None);
         }
 
-        let split_point = turns.len().saturating_sub(self.keep_turns);
-        let head: Vec<&Turn> = turns[..split_point].iter().collect();
+        let head: Vec<&Turn> = turns.iter().collect();
         let previous_summary = self.state.load_last_summary()?;
         let prev_text = previous_summary.as_ref().map(|t| t.assistant_content.clone());
 
@@ -68,9 +64,10 @@ impl Compactor {
             merge_summaries_tree(&self.client, &summaries, prev_text.as_deref(), usable, on_chunk).await?
         };
 
-        self.state.hide_turns_before_seq(turns[split_point].seq)?;
+        let last_seq = turns.last().unwrap().seq;
+        self.state.hide_turns_before_seq(last_seq)?;
         self.state.insert_summary_turn(&summary)?;
-        Ok(summary)
+        Ok(Some(summary))
     }
 }
 

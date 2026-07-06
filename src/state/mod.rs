@@ -450,7 +450,7 @@ mod tests {
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 2);
 
-        let hidden_count = store.hide_turns_before_seq(visible[1].seq).unwrap();
+        let hidden_count = store.hide_turns_before_seq(visible[0].seq).unwrap();
         assert_eq!(hidden_count, 1);
 
         let visible_after = store.load_visible_turns().unwrap();
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_turn_not_hidden_by_hide_before_seq() {
+    fn hide_before_seq_hides_old_summary_too() {
         let (_temp, store) = test_store();
         store.start_turn("t1", "old").unwrap();
         store.complete_turn("t1", "old reply", None).unwrap();
@@ -498,12 +498,10 @@ mod tests {
 
         let t2_seq = visible.last().unwrap().seq;
         let hidden = store.hide_turns_before_seq(t2_seq).unwrap();
-        assert_eq!(hidden, 1);
+        assert_eq!(hidden, 3);
 
         let visible_after = store.load_visible_turns().unwrap();
-        assert_eq!(visible_after.len(), 2);
-        assert!(visible_after.iter().any(|t| t.is_summary));
-        assert!(visible_after.iter().any(|t| !t.is_summary && t.turn_id == "t2"));
+        assert!(visible_after.is_empty());
     }
 
     #[test]
