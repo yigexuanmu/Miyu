@@ -394,26 +394,51 @@ impl Agent {
             result.usage_estimated,
         )?;
         self.memory.process_after_turn(&input, &result.content)?;
-        if let Some(usage) = &result.usage {
-            self.state.add_usage(usage)?;
-            self.handle_overflow(usage, &mut on_event).await?;
+        if let Some(usage) = result.usage.clone() {
+            self.state.add_usage(&usage)?;
         }
         Ok(result)
     }
 
-    async fn handle_overflow<F>(&self, usage: &Usage, on_event: &mut F) -> Result<()>
+    pub async fn handle_overflow_after_turn<F>(
+        &self,
+        usage: &Usage,
+        on_event: F,
+    ) -> Result<Option<ChatResult>>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let mut on_event = on_event;
+        let Some(compact) = self.handle_overflow(usage, &mut on_event).await? else {
+            return Ok(None);
+        };
+        self.state.add_usage(&compact.usage)?;
+        Ok(Some(ChatResult {
+            content: String::new(),
+            reasoning: None,
+            usage: Some(compact.usage),
+            usage_estimated: compact.usage_estimated,
+            tool_calls: Vec::new(),
+        }))
+    }
+
+    async fn handle_overflow<F>(
+        &self,
+        usage: &Usage,
+        on_event: &mut F,
+    ) -> Result<Option<compact::CompactResult>>
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
         let check = overflow::OverflowCheck::new(self.context_window, self.trim_at_ratio, None);
         if !check.is_enabled() || !check.check_usage(usage) {
-            return Ok(());
+            return Ok(None);
         }
-        match self.on_overflow.as_str() {
+        let compact_result = match self.on_overflow.as_str() {
             "compact" => {
                 let visible_count = self.state.load_visible_turns()?.len();
                 if visible_count == 0 {
-                    return Ok(());
+                    return Ok(None);
                 }
                 on_event(AgentEvent::CompactStart)?;
                 let compactor = compact::Compactor::new(
@@ -425,8 +450,9 @@ impl Agent {
                 let mut on_chunk =
                     |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
                 match compactor.perform_compact(&mut on_chunk).await {
-                    Ok(_) => {
+                    Ok(result) => {
                         on_event(AgentEvent::CompactEnd)?;
+                        result
                     }
                     Err(e) => {
                         on_event(AgentEvent::CompactEnd)?;
@@ -453,10 +479,11 @@ impl Agent {
                 on_event(AgentEvent::PopEnd {
                     popped_count: evicted_turns.len(),
                 })?;
+                None
             }
-            _ => {}
-        }
-        Ok(())
+            _ => None,
+        };
+        Ok(compact_result)
     }
 
     fn current_model_supports_vision(&self) -> bool {

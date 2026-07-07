@@ -1460,6 +1460,7 @@ async fn run_chat_with_images(
     renderer.finish()?;
     let result = result?;
     print_chat_token_usage(&result, show_token_usage, state.token_total()?)?;
+    handle_post_turn_overflow(&agent, &mut renderer, &result, show_token_usage, &state).await?;
     Ok(())
 }
 
@@ -1562,6 +1563,7 @@ async fn run_chat_with_options(
     renderer.finish()?;
     let result = result?;
     print_chat_token_usage(&result, show_token_usage, state.token_total()?)?;
+    handle_post_turn_overflow(&agent, &mut renderer, &result, show_token_usage, &state).await?;
     Ok(())
 }
 
@@ -1575,6 +1577,26 @@ fn print_chat_token_usage(
             let turn_tokens = render::usage_total(usage);
             render::print_token_usage(turn_tokens, session_token_total, result.usage_estimated)?;
         }
+    }
+    Ok(())
+}
+
+async fn handle_post_turn_overflow(
+    agent: &Agent,
+    renderer: &mut render::StreamRenderer,
+    result: &crate::llm::ChatResult,
+    show_token_usage: bool,
+    state: &StateStore,
+) -> Result<()> {
+    let Some(usage) = result.usage.as_ref() else {
+        return Ok(());
+    };
+    let compact_result = agent
+        .handle_overflow_after_turn(usage, |event| handle_agent_event(renderer, event))
+        .await?;
+    renderer.finish()?;
+    if let Some(compact_result) = compact_result {
+        print_chat_token_usage(&compact_result, show_token_usage, state.token_total()?)?;
     }
     Ok(())
 }
@@ -1705,6 +1727,18 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
                     config.display.show_token_usage,
                     state.token_total()?,
                 )?;
+                if let Err(err) = handle_post_turn_overflow(
+                    &agent,
+                    &mut renderer,
+                    &result,
+                    config.display.show_token_usage,
+                    &state,
+                )
+                .await
+                {
+                    eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
+                    continue;
+                }
             }
             Ok(None) => {}
             Err(err) => {

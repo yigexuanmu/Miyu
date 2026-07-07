@@ -151,8 +151,14 @@ impl StateStore {
         self.conv_db.hide_turns_before_seq(seq)
     }
 
-    pub fn insert_summary_turn(&self, summary: &str) -> Result<()> {
-        self.conv_db.insert_summary_turn(summary)
+    pub fn insert_summary_turn(
+        &self,
+        summary: &str,
+        token_total: Option<u64>,
+        token_usage_estimated: bool,
+    ) -> Result<()> {
+        self.conv_db
+            .insert_summary_turn(summary, token_total, token_usage_estimated)
     }
 
     pub fn load_last_summary(&self) -> Result<Option<Turn>> {
@@ -514,7 +520,9 @@ mod tests {
         store.start_turn("t1", "hello", 999999).unwrap();
         store.complete_turn("t1", "hi", None).unwrap();
 
-        store.insert_summary_turn("## Task Goal\nDo stuff").unwrap();
+        store
+            .insert_summary_turn("## Task Goal\nDo stuff", Some(12), true)
+            .unwrap();
 
         let summary = store.load_last_summary().unwrap();
         assert!(summary.is_some());
@@ -522,6 +530,8 @@ mod tests {
         assert!(summary.is_summary);
         assert!(!summary.hidden);
         assert_eq!(summary.assistant_content, "## Task Goal\nDo stuff");
+        assert_eq!(summary.token_total, 12);
+        assert!(summary.token_usage_estimated);
 
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 2);
@@ -534,7 +544,9 @@ mod tests {
         let (_temp, store) = test_store();
         store.start_turn("t1", "old", 999999).unwrap();
         store.complete_turn("t1", "old reply", None).unwrap();
-        store.insert_summary_turn("summary of old").unwrap();
+        store
+            .insert_summary_turn("summary of old", Some(8), true)
+            .unwrap();
         store.start_turn("t2", "new", 999999).unwrap();
         store.complete_turn("t2", "new reply", None).unwrap();
 

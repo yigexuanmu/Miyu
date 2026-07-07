@@ -249,7 +249,12 @@ impl ConversationDb {
         Ok(affected)
     }
 
-    pub fn insert_summary_turn(&self, summary: &str) -> Result<()> {
+    pub fn insert_summary_turn(
+        &self,
+        summary: &str,
+        token_total: Option<u64>,
+        token_usage_estimated: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let turn_id = format!(
             "summary_{}_{}",
@@ -261,12 +266,24 @@ impl ConversationDb {
         );
         let seq = self.next_seq_locked(&conn)?;
         let now = Utc::now().to_rfc3339();
+        let token_total = token_total.unwrap_or(0) as i64;
+        let token_usage_estimated = i64::from(token_usage_estimated);
         conn.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', '[]', 0, 1)",
-            params![turn_id, seq, "[conversation summary]", now, summary, now],
+            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', '[]', 0, 1, ?7, ?8)",
+            params![turn_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated],
         )?;
         Ok(())
+    }
+
+    pub fn token_total(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_total), 0) FROM turns WHERE status = 'completed' AND hidden = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as u64)
     }
 
     pub fn load_last_summary(&self) -> Result<Option<Turn>> {
@@ -341,16 +358,6 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM turns", [])?;
         Ok(())
-    }
-
-    pub fn token_total(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let total: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(token_total), 0) FROM turns WHERE status = 'completed' AND is_summary = 0",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(total.max(0) as u64)
     }
 
     pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {

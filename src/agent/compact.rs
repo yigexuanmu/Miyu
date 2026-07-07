@@ -1,4 +1,4 @@
-use crate::llm::{ChatMessage, ChatStreamChunk, OpenAiCompatibleClient};
+use crate::llm::{ChatMessage, ChatResult, ChatStreamChunk, OpenAiCompatibleClient, Usage};
 use crate::prompts::COMPACT_SYSTEM_PROMPT;
 use crate::state::{StateStore, Turn};
 use anyhow::Result;
@@ -13,6 +13,17 @@ pub struct Compactor {
     state: StateStore,
     context_window: usize,
     reserved_tokens: usize,
+}
+
+pub struct CompactResult {
+    pub usage: Usage,
+    pub usage_estimated: bool,
+}
+
+struct CompactTextResult {
+    text: String,
+    usage: Usage,
+    usage_estimated: bool,
 }
 
 impl Compactor {
@@ -30,7 +41,7 @@ impl Compactor {
         }
     }
 
-    pub async fn perform_compact<F>(&self, on_chunk: &mut F) -> Result<Option<String>>
+    pub async fn perform_compact<F>(&self, on_chunk: &mut F) -> Result<Option<CompactResult>>
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
@@ -53,32 +64,62 @@ impl Compactor {
         let head_text = turns_to_text(&head);
         let head_tokens = estimate_tokens(&head_text);
 
+        let mut compact_usage = Usage::default();
+        let mut usage_estimated = false;
+
         let summary = if head_tokens <= usable {
-            compact_single_pass(&self.client, &head_text, prev_text.as_deref(), on_chunk).await?
+            let result =
+                compact_single_pass(&self.client, &head_text, prev_text.as_deref(), on_chunk)
+                    .await?;
+            add_usage(&mut compact_usage, &result.usage);
+            usage_estimated |= result.usage_estimated;
+            result.text
         } else {
             let segments = split_into_segments(&head, usable);
             let mut summaries = Vec::new();
             for segment in &segments {
                 let segment_text = turns_to_text(segment);
-                let s =
+                let result =
                     compact_single_pass(&self.client, &segment_text, None, &mut |_| Ok(())).await?;
-                summaries.push(s);
+                add_usage(&mut compact_usage, &result.usage);
+                usage_estimated |= result.usage_estimated;
+                summaries.push(result.text);
             }
-            merge_summaries_tree(
+            let result = merge_summaries_tree(
                 &self.client,
                 &summaries,
                 prev_text.as_deref(),
                 usable,
                 on_chunk,
             )
-            .await?
+            .await?;
+            add_usage(&mut compact_usage, &result.usage);
+            usage_estimated |= result.usage_estimated;
+            result.text
         };
 
         let last_seq = turns.last().unwrap().seq;
         self.state.hide_turns_before_seq(last_seq)?;
-        self.state.insert_summary_turn(&summary)?;
-        Ok(Some(summary))
+        self.state.insert_summary_turn(
+            &summary,
+            Some(compact_usage.effective_total_tokens()),
+            usage_estimated,
+        )?;
+        Ok(Some(CompactResult {
+            usage: compact_usage,
+            usage_estimated,
+        }))
     }
+}
+
+fn add_usage(total: &mut Usage, usage: &Usage) {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(usage.completion_tokens);
+    total.total_tokens = total
+        .total_tokens
+        .saturating_add(usage.effective_total_tokens());
 }
 
 fn turns_to_text(turns: &[&Turn]) -> String {
@@ -129,7 +170,7 @@ async fn compact_single_pass<F>(
     history: &str,
     previous_summary: Option<&str>,
     on_chunk: &mut F,
-) -> Result<String>
+) -> Result<CompactTextResult>
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
@@ -138,8 +179,10 @@ where
         ChatMessage::system(COMPACT_SYSTEM_PROMPT.to_string()),
         ChatMessage::plain("user", &prompt),
     ];
-    let result = client.chat_stream(messages, vec![], on_chunk).await?;
-    Ok(result.content)
+    let result = client
+        .chat_stream(messages.clone(), vec![], on_chunk)
+        .await?;
+    Ok(compact_text_result(result, &messages))
 }
 
 async fn compact_single_pass_text<F>(
@@ -147,7 +190,7 @@ async fn compact_single_pass_text<F>(
     text: &str,
     previous_summary: Option<&str>,
     on_chunk: &mut F,
-) -> Result<String>
+) -> Result<CompactTextResult>
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
@@ -167,8 +210,32 @@ where
         ChatMessage::system(COMPACT_SYSTEM_PROMPT.to_string()),
         ChatMessage::plain("user", &prompt),
     ];
-    let result = client.chat_stream(messages, vec![], on_chunk).await?;
-    Ok(result.content)
+    let result = client
+        .chat_stream(messages.clone(), vec![], on_chunk)
+        .await?;
+    Ok(compact_text_result(result, &messages))
+}
+
+fn compact_text_result(result: ChatResult, messages: &[ChatMessage]) -> CompactTextResult {
+    if let Some(usage) = result.usage {
+        return CompactTextResult {
+            text: result.content,
+            usage,
+            usage_estimated: result.usage_estimated,
+        };
+    }
+
+    let prompt_tokens = super::overflow::estimate_messages_tokens(messages) as u64;
+    let completion_tokens = estimate_tokens(&result.content) as u64;
+    CompactTextResult {
+        text: result.content,
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        },
+        usage_estimated: true,
+    }
 }
 
 fn split_into_segments<'a>(turns: &[&'a Turn], budget_tokens: usize) -> Vec<Vec<&'a Turn>> {
@@ -210,22 +277,36 @@ async fn merge_summaries_tree<F>(
     previous_summary: Option<&str>,
     usable_tokens: usize,
     on_chunk: &mut F,
-) -> Result<String>
+) -> Result<CompactTextResult>
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
     if summaries.len() == 1 {
-        return Ok(summaries[0].clone());
+        return Ok(CompactTextResult {
+            text: summaries[0].clone(),
+            usage: Usage::default(),
+            usage_estimated: false,
+        });
     }
 
     let mut current: Vec<String> = summaries.to_vec();
+    let mut total_usage = Usage::default();
+    let mut usage_estimated = false;
 
     for _round in 0..MAX_MERGE_ROUNDS {
         let combined = current.join("\n\n---\n\n");
         let combined_tokens = estimate_tokens(&combined);
 
         if combined_tokens <= usable_tokens {
-            return compact_single_pass_text(client, &combined, previous_summary, on_chunk).await;
+            let result =
+                compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+            add_usage(&mut total_usage, &result.usage);
+            usage_estimated |= result.usage_estimated;
+            return Ok(CompactTextResult {
+                text: result.text,
+                usage: total_usage,
+                usage_estimated,
+            });
         }
 
         let mut next = Vec::new();
@@ -238,7 +319,9 @@ where
                 let batch_text = batch.join("\n\n---\n\n");
                 let merged =
                     compact_single_pass_text(client, &batch_text, None, &mut |_| Ok(())).await?;
-                next.push(merged);
+                add_usage(&mut total_usage, &merged.usage);
+                usage_estimated |= merged.usage_estimated;
+                next.push(merged.text);
                 batch.clear();
                 batch_tokens = 0;
             }
@@ -249,16 +332,33 @@ where
             let batch_text = batch.join("\n\n---\n\n");
             let merged =
                 compact_single_pass_text(client, &batch_text, None, &mut |_| Ok(())).await?;
-            next.push(merged);
+            add_usage(&mut total_usage, &merged.usage);
+            usage_estimated |= merged.usage_estimated;
+            next.push(merged.text);
         }
 
         if next.len() >= current.len() {
             let combined = current.join("\n\n---\n\n");
-            return compact_single_pass_text(client, &combined, previous_summary, on_chunk).await;
+            let result =
+                compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+            add_usage(&mut total_usage, &result.usage);
+            usage_estimated |= result.usage_estimated;
+            return Ok(CompactTextResult {
+                text: result.text,
+                usage: total_usage,
+                usage_estimated,
+            });
         }
         current = next;
     }
 
     let combined = current.join("\n\n---\n\n");
-    compact_single_pass_text(client, &combined, previous_summary, on_chunk).await
+    let result = compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+    add_usage(&mut total_usage, &result.usage);
+    usage_estimated |= result.usage_estimated;
+    Ok(CompactTextResult {
+        text: result.text,
+        usage: total_usage,
+        usage_estimated,
+    })
 }

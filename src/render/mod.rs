@@ -85,7 +85,7 @@ pub fn print_token_usage(turn_tokens: u64, session_tokens: u64, estimated: bool)
         )
     };
     let mut stdout = io::stdout();
-    writeln!(stdout, "\x1b[2m{line}\x1b[0m")?;
+    writeln!(stdout, "\x1b[2m{line}\x1b[0m\n")?;
     stdout.flush()?;
     Ok(())
 }
