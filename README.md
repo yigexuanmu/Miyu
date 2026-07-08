@@ -34,42 +34,35 @@
 
 ## NixOS 安装
 
-### Home Manager
-
-在 `home.nix` 中添加：
+### 1. 在 flake.nix 中添加输入
 
 ```nix
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    home-manager.url = "github:nix-community/home-manager";
     miyu.url = "github:yigexuanmu/Miyu";
   };
-
-  outputs = { nixpkgs, home-manager, miyu, ... }:
-  {
-    home.packages = [ miyu.packages.x86_64-linux.default ];
-  };
 }
 ```
 
-### configuration.nix (全局)
+### 2. 在 configuration.nix 中添加
 
 ```nix
-{ config, pkgs, ... }:
+{ inputs, ... }:
 
-let
-  miyu = builtins.getFlake "github:yigexuanmu/Miyu";
-in
 {
-  environment.systemPackages = [ miyu.packages.x86_64-linux.default ];
+  environment.systemPackages = [ inputs.miyu.packages.x86_64-linux.default ];
 }
 ```
 
-### 临时使用
+### Home Manager
 
-```bash
-nix run github:yigexuanmu/Miyu
+```nix
+{ inputs, ... }:
+
+{
+  home.packages = [ inputs.miyu.packages.x86_64-linux.default ];
+}
 ```
 
 ## 致谢
