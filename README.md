@@ -34,14 +34,13 @@
 
 ## 安装
 
-### 使用 Nix Flakes (推荐)
+### NixOS
 
 ```bash
-# 克隆仓库
 git clone https://github.com/yigexuanmu/Miyu.git
 cd Miyu
 
-# 进入开发环境（自动安装所有依赖）
+# 进入开发环境
 nix develop
 
 # 构建
@@ -62,13 +61,6 @@ cargo build --release
 
 # 运行
 ./target/release/miyu
-```
-
-## 使用
-
-编辑或写入文件时自动显示变更对比：
-```bash
-miyu "帮我修改 README.md"
 ```
 
 ## 致谢
