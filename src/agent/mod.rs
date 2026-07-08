@@ -238,19 +238,12 @@ impl Agent {
                 _ => None,
             })
             .collect();
-        let temp_paths: Vec<String> = if !binary_images.is_empty() {
-            binary_images
-                .iter()
-                .enumerate()
-                .filter_map(|(i, img)| {
-                    img.write_temp_file(&self.paths.cache_dir, i)
-                        .ok()
-                        .map(|p| p.display().to_string())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let absolute_image_paths = resolve_pasted_image_paths(images, &self.paths);
+        let temp_paths: Vec<String> = absolute_image_paths
+            .iter()
+            .filter_map(|path| path.clone())
+            .collect();
+        let input = rewrite_image_placeholders_with_paths(&input, &absolute_image_paths);
         let input = if !binary_images.is_empty() && !self.current_model_supports_vision() {
             self.describe_images_with_vision_provider(&input, &binary_images)
                 .await?
@@ -1108,6 +1101,60 @@ fn clipboard_binary_image_from_tool_result(
         .to_string();
     let data = std::fs::read(path).ok()?;
     Some(ClipboardImage { mime, data })
+}
+
+fn resolve_pasted_image_paths(
+    images: &[Option<PastedImage>],
+    paths: &MiyuPaths,
+) -> Vec<Option<String>> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, image)| match image {
+            Some(PastedImage::Binary(img)) => img
+                .write_temp_file(&paths.cache_dir, i + 1)
+                .ok()
+                .map(|path| path.display().to_string()),
+            Some(PastedImage::Path(path)) => Some(path.clone()),
+            None => None,
+        })
+        .collect()
+}
+
+fn rewrite_image_placeholders_with_paths(input: &str, paths: &[Option<String>]) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("[Image ") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let Some(end) = after_start.find(']') else {
+            output.push_str(after_start);
+            return output;
+        };
+        let placeholder = &after_start[..=end];
+        if let Some(index) = image_placeholder_index(placeholder) {
+            if let Some(Some(path)) = paths.get(index - 1) {
+                output.push_str(&format!("[Image {index}: {path}]"));
+            } else {
+                output.push_str(placeholder);
+            }
+        } else {
+            output.push_str(placeholder);
+        }
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn image_placeholder_index(placeholder: &str) -> Option<usize> {
+    let inner = placeholder
+        .strip_prefix("[Image ")?
+        .strip_suffix(']')?
+        .trim_start();
+    let num: String = inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let index = num.parse::<usize>().ok()?;
+    (index > 0).then_some(index)
 }
 
 fn vision_analysis_progress(tick: usize) -> String {

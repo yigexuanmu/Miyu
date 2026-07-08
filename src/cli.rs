@@ -1623,13 +1623,14 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         println!("\x1b[2m{message}\x1b[0m");
     }
     loop {
-        let (input, pasted_images) = match read_repl_input(mode, prefill.take(), &input_history)? {
-            Some((new_mode, input, pasted_images)) => {
-                mode = new_mode;
-                (input, pasted_images)
-            }
-            None => break,
-        };
+        let (input, pasted_images) =
+            match read_repl_input(paths, mode, prefill.take(), &input_history)? {
+                Some((new_mode, input, pasted_images)) => {
+                    mode = new_mode;
+                    (input, pasted_images)
+                }
+                None => break,
+            };
         let input = input.trim();
         if input.eq_ignore_ascii_case("exit")
             || input.eq_ignore_ascii_case("quit")
@@ -1840,6 +1841,7 @@ fn print_repl_help() {
 }
 
 fn read_repl_input(
+    paths: &MiyuPaths,
     mut mode: AgentMode,
     prefill: Option<String>,
     history: &[String],
@@ -2191,7 +2193,16 @@ fn read_repl_input(
                     match crate::clipboard::read_clipboard() {
                         Ok(crate::clipboard::ClipboardContent::Image(img)) => {
                             let index = pasted_images.len() + 1;
-                            let placeholder = format!("[Image {}]", index);
+                            let placeholder = match img.write_temp_file(&paths.cache_dir, index) {
+                                Ok(path) => {
+                                    let filename = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("image");
+                                    format!("[Image {}: {}]", index, filename)
+                                }
+                                Err(_) => format!("[Image {}]", index),
+                            };
                             insert_str_at_cursor(&mut input, &mut cursor, &placeholder);
                             pasted_images.push(Some(crate::clipboard::PastedImage::Binary(img)));
                             is_pasted = false;
