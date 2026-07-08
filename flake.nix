@@ -1,15 +1,6 @@
 {
   description = "Miyu - TUI Diff 显示";
 
-  nixConfig = {
-    extra-substituters = [
-      "https://miyu.cachix.org"
-    ];
-    extra-trusted-public-keys = [
-      "miyu.cachix.org-1:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx="
-    ];
-  };
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
