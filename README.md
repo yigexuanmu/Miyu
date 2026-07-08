@@ -32,10 +32,36 @@
 }
 ```
 
-## 编译
+## 安装
+
+### 使用 Nix Flakes (推荐)
 
 ```bash
+# 克隆仓库
+git clone https://github.com/yigexuanmu/Miyu.git
+cd Miyu
+
+# 进入开发环境（自动安装所有依赖）
+nix develop
+
+# 构建
+nix build
+
+# 运行
+./result/bin/miyu
+```
+
+### 手动编译
+
+```bash
+# 安装依赖 (Arch Linux)
+sudo pacman -S pkg-config alsa-lib openssl sqlite
+
+# 编译
 cargo build --release
+
+# 运行
+./target/release/miyu
 ```
 
 ## 使用
