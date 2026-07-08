@@ -1625,14 +1625,24 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
         println!("\x1b[2m{message}\x1b[0m");
     }
+    let initial_registry = build_tool_registry(&config, paths, mode)?;
+    let mut agent = Agent::new(
+        config.clone(),
+        paths,
+        state.clone(),
+        client.clone(),
+        initial_registry,
+        mode,
+    )?;
     loop {
-        let (input, pasted_images) = match read_repl_input(mode, prefill.take(), &input_history)? {
-            Some((new_mode, input, pasted_images)) => {
-                mode = new_mode;
-                (input, pasted_images)
-            }
-            None => break,
-        };
+        let (input, pasted_images) =
+            match read_repl_input(paths, mode, prefill.take(), &input_history)? {
+                Some((new_mode, input, pasted_images)) => {
+                    mode = new_mode;
+                    (input, pasted_images)
+                }
+                None => break,
+            };
         let input = input.trim();
         if input.eq_ignore_ascii_case("exit")
             || input.eq_ignore_ascii_case("quit")
@@ -1662,12 +1672,18 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         if input.eq_ignore_ascii_case("/providers") {
             run_providers(paths, ProvidersArgs { index: None })?;
             reload_repl_config(paths, &mut config, &mut client)?;
+            let registry = build_tool_registry(&config, paths, mode)?;
+            agent.reload_config(config.clone(), client.clone())?;
+            agent.switch_mode(mode, registry);
             println!("{}", t("configuration reloaded", "配置已重新加载"));
             continue;
         }
         if input.eq_ignore_ascii_case("/config") {
             crate::config_tui::run(paths)?;
             reload_repl_config(paths, &mut config, &mut client)?;
+            let registry = build_tool_registry(&config, paths, mode)?;
+            agent.reload_config(config.clone(), client.clone())?;
+            agent.switch_mode(mode, registry);
             println!("{}", t("configuration reloaded", "配置已重新加载"));
             continue;
         }
@@ -1685,21 +1701,18 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         if input.eq_ignore_ascii_case("/reset all") {
             run_reset(paths, Some("all"))?;
             input_history.clear();
+            agent.reset_memory()?;
             continue;
         }
         if input.is_empty() {
             continue;
         }
         input_history.push(input.to_string());
-        let registry = build_tool_registry(&config, paths, mode)?;
-        let mut agent = Agent::new(
-            config.clone(),
-            paths,
-            state.clone(),
-            client.clone(),
-            registry,
-            mode,
-        )?;
+        if agent.mode() != mode {
+            let registry = build_tool_registry(&config, paths, mode)?;
+            agent.switch_mode(mode, registry);
+        }
+        agent.prepare_for_turn()?;
         let reasoning_mode = render::ReasoningDisplayMode::from_config(&config.display.reasoning);
         let tool_call_mode = render::ToolCallDisplayMode::from_config(&config.display.tool_calls);
         let mut renderer = render::StreamRenderer::new(
@@ -1843,6 +1856,7 @@ fn print_repl_help() {
 }
 
 fn read_repl_input(
+    paths: &MiyuPaths,
     mut mode: AgentMode,
     prefill: Option<String>,
     history: &[String],
@@ -2194,7 +2208,16 @@ fn read_repl_input(
                     match crate::clipboard::read_clipboard() {
                         Ok(crate::clipboard::ClipboardContent::Image(img)) => {
                             let index = pasted_images.len() + 1;
-                            let placeholder = format!("[Image {}]", index);
+                            let placeholder = match img.write_temp_file(&paths.cache_dir, index) {
+                                Ok(path) => {
+                                    let filename = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("image");
+                                    format!("[Image {}: {}]", index, filename)
+                                }
+                                Err(_) => format!("[Image {}]", index),
+                            };
                             insert_str_at_cursor(&mut input, &mut cursor, &placeholder);
                             pasted_images.push(Some(crate::clipboard::PastedImage::Binary(img)));
                             is_pasted = false;
@@ -3417,12 +3440,7 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             renderer.write_tool_progress(&name, &message)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ExternalOutput => renderer.prepare_for_external_output(),
         AgentEvent::SpinnerTick => renderer.tick_spinner(),
-        AgentEvent::MemeSelectPhase => {
-            renderer.set_meme_select_phase()?;
-            renderer.tick_spinner()
-        }
         AgentEvent::CompactStart => {
             renderer.write_system_message("正在压缩上下文...")?;
             renderer.tick_spinner()

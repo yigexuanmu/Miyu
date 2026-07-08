@@ -19,7 +19,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct PendingTurnGuard {
@@ -122,9 +122,7 @@ pub enum AgentEvent {
         name: String,
         message: String,
     },
-    ExternalOutput,
     SpinnerTick,
-    MemeSelectPhase,
     CompactStart,
     CompactChunk(ChatStreamChunk),
     CompactEnd,
@@ -188,6 +186,49 @@ impl Agent {
         })
     }
 
+    pub fn prepare_for_turn(&mut self) -> Result<()> {
+        let base_system_prompt = self.config.system_prompt(&self.paths)?;
+        if matches!(self.mode, AgentMode::Normal | AgentMode::Chat) {
+            self.state.reset_if_prompt_changed(&base_system_prompt)?;
+            self.state.recover_stale_turns()?;
+        }
+        self.system_prompt = with_current_time(base_system_prompt, self.mode);
+        Ok(())
+    }
+
+    pub fn mode(&self) -> AgentMode {
+        self.mode
+    }
+
+    pub fn switch_mode(&mut self, mode: AgentMode, tools: ToolRegistry) {
+        self.mode = mode;
+        self.tools = Arc::new(Mutex::new(tools));
+    }
+
+    pub fn reload_config(
+        &mut self,
+        config: AppConfig,
+        client: OpenAiCompatibleClient,
+    ) -> Result<()> {
+        self.config = config;
+        self.client = client;
+        self.tools_enabled = self.config.tools.enabled;
+        self.max_tool_rounds = self.config.tools.max_rounds;
+        self.trim_at_ratio = self.config.context.trim_at_ratio;
+        self.trim_batch_ratio = self.config.context.trim_batch_ratio;
+        self.context_window = self.config.active_context_window()?;
+        self.on_overflow = self.config.context.on_overflow.clone();
+        self.memory = MemoryStore::new(&self.config, &self.paths);
+        self.memory.init()?;
+        self.prepare_for_turn()
+    }
+
+    pub fn reset_memory(&mut self) -> Result<()> {
+        self.memory = MemoryStore::new(&self.config, &self.paths);
+        self.memory.init()?;
+        Ok(())
+    }
+
     pub async fn chat_stream<F>(&mut self, input: &str, on_event: F) -> Result<ChatResult>
     where
         F: FnMut(AgentEvent) -> Result<()>,
@@ -238,19 +279,12 @@ impl Agent {
                 _ => None,
             })
             .collect();
-        let temp_paths: Vec<String> = if !binary_images.is_empty() {
-            binary_images
-                .iter()
-                .enumerate()
-                .filter_map(|(i, img)| {
-                    img.write_temp_file(&self.paths.cache_dir, i)
-                        .ok()
-                        .map(|p| p.display().to_string())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let absolute_image_paths = resolve_pasted_image_paths(images, &self.paths);
+        let temp_paths: Vec<String> = absolute_image_paths
+            .iter()
+            .filter_map(|path| path.clone())
+            .collect();
+        let input = rewrite_image_placeholders_with_paths(&input, &absolute_image_paths);
         let input = if !binary_images.is_empty() && !self.current_model_supports_vision() {
             self.describe_images_with_vision_provider(&input, &binary_images)
                 .await?
@@ -332,38 +366,10 @@ impl Agent {
             }
         }
         let mut on_event = on_event;
-        let meme_future = async {
-            if self.mode == AgentMode::Chat {
-                Ok(None)
-            } else {
-                memes::plan_auto_meme_before_reply(&self.config, &self.paths, &self.client, &input)
-                    .await
+        if self.mode != AgentMode::Plan {
+            if let Some(reminder) = memes::auto_meme_reminder(&self.config, &input) {
+                messages.push(ChatMessage::system(reminder));
             }
-        };
-        tokio::pin!(meme_future);
-        let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
-        spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        spinner_interval.tick().await;
-        let meme_start = Instant::now();
-        let mut meme_phase_switched = false;
-        let auto_meme_plan = loop {
-            tokio::select! {
-                result = &mut meme_future => {
-                    break result?;
-                }
-                _ = spinner_interval.tick() => {
-                    if !meme_phase_switched
-                        && meme_start.elapsed() >= Duration::from_millis(150)
-                    {
-                        on_event(AgentEvent::MemeSelectPhase)?;
-                        meme_phase_switched = true;
-                    }
-                    on_event(AgentEvent::SpinnerTick)?;
-                }
-            }
-        };
-        if let Some(plan) = &auto_meme_plan {
-            messages.push(ChatMessage::system(plan.reminder.clone()));
         }
         let mut used_tools = Vec::new();
         let mut persisted_tool_reports = Vec::new();
@@ -375,11 +381,6 @@ impl Agent {
                 &mut on_event,
             )
             .await?;
-        if let Some(plan) = auto_meme_plan {
-            on_event(AgentEvent::ExternalOutput)?;
-            memes::render_auto_meme(&self.config, &self.paths, &plan.event).await?;
-            memes::record_auto_meme_event(&self.config, &self.paths, &plan.event)?;
-        }
         for (tool_name, report) in persisted_tool_reports {
             self.state
                 .append_tool_report_context(&turn_id, &tool_name, &report)?;
@@ -854,9 +855,6 @@ impl Agent {
         current_input: &str,
     ) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
-        if let Some(summary) = memes::last_auto_meme_reminder(&self.config, &self.paths)? {
-            messages.push(ChatMessage::system(summary));
-        }
         if let Some(summary) = self.state.load_last_summary()? {
             messages.push(ChatMessage::system(format!(
                 "<conversation-summary>\n{}\n</conversation-summary>",
@@ -1110,6 +1108,60 @@ fn clipboard_binary_image_from_tool_result(
     Some(ClipboardImage { mime, data })
 }
 
+fn resolve_pasted_image_paths(
+    images: &[Option<PastedImage>],
+    paths: &MiyuPaths,
+) -> Vec<Option<String>> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, image)| match image {
+            Some(PastedImage::Binary(img)) => img
+                .write_temp_file(&paths.cache_dir, i + 1)
+                .ok()
+                .map(|path| path.display().to_string()),
+            Some(PastedImage::Path(path)) => Some(path.clone()),
+            None => None,
+        })
+        .collect()
+}
+
+fn rewrite_image_placeholders_with_paths(input: &str, paths: &[Option<String>]) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("[Image ") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let Some(end) = after_start.find(']') else {
+            output.push_str(after_start);
+            return output;
+        };
+        let placeholder = &after_start[..=end];
+        if let Some(index) = image_placeholder_index(placeholder) {
+            if let Some(Some(path)) = paths.get(index - 1) {
+                output.push_str(&format!("[Image {index}: {path}]"));
+            } else {
+                output.push_str(placeholder);
+            }
+        } else {
+            output.push_str(placeholder);
+        }
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn image_placeholder_index(placeholder: &str) -> Option<usize> {
+    let inner = placeholder
+        .strip_prefix("[Image ")?
+        .strip_suffix(']')?
+        .trim_start();
+    let num: String = inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let index = num.parse::<usize>().ok()?;
+    (index > 0).then_some(index)
+}
+
 fn vision_analysis_progress(tick: usize) -> String {
     let dots = match tick % 3 {
         1 => ".",
@@ -1130,14 +1182,14 @@ fn with_current_time(system_prompt: String, mode: AgentMode) -> String {
     let mut prompt = if mode == AgentMode::Chat {
         format!(
             "{system_prompt}\n\n<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",
-            Local::now().format("%Y年%m月%d日 %H:%M"),
+            Local::now().format("%Y年%m月%d日 %A %H:%M"),
             xml_attr_escape(&cwd),
         )
     } else {
         let runtime = terminal_runtime_context();
         format!(
             "{system_prompt}\n\n<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
-            Local::now().format("%Y年%m月%d日 %H:%M"),
+            Local::now().format("%Y年%m月%d日 %A %H:%M"),
             xml_attr_escape(&cwd),
         )
     };

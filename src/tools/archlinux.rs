@@ -11,7 +11,7 @@ const ARCH_NEWS_CACHE_FILE: &str = "arch_news_last_seen.json";
 pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
     registry.register(ToolSpec::new("aur_search_packages", "Search AUR packages via official RPC.", json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"search_by":{"type":"string"}},"required":["query"],"additionalProperties":false}), |args| async move { aur_search(args).await }));
     registry.register(ToolSpec::new("aur_get_package_info", "Get AUR package information via official RPC.", json!({"type":"object","properties":{"package_name":{"type":"string"}},"required":["package_name"],"additionalProperties":false}), |args| async move { aur_info(args).await }));
-    registry.register(ToolSpec::new("archlinux_official_package_query", "Query official Arch Linux package database. Supports search and exact package details. / 查询 Arch Linux 官方软件包数据库，支持搜索和精确包详情。", json!({"type":"object","properties":{"package_name":{"type":"string","description":"Package name. / 包名。"},"repo":{"type":"string","description":"Repository for detail mode, e.g. core or extra. / 详情模式的仓库，例如 core 或 extra。"},"arch":{"type":"string","description":"Architecture for detail mode, default x86_64. / 详情模式架构，默认 x86_64。"},"mode":{"type":"string","enum":["auto","search","detail"],"description":"auto uses detail when repo is provided, otherwise search. / auto 在提供 repo 时查详情，否则搜索。"}},"required":["package_name"],"additionalProperties":false}), |args| async move { official_package_query(args).await }));
+    registry.register(ToolSpec::new("archlinux_official_package_query", "查询 Arch Linux 官方软件包数据库，支持搜索和精确包详情。", json!({"type":"object","properties":{"package_name":{"type":"string","description":"包名。"},"repo":{"type":"string","description":"详情模式的仓库，例如 core 或 extra。"},"arch":{"type":"string","description":"详情模式架构，默认 x86_64。"},"mode":{"type":"string","enum":["auto","search","detail"],"description":"auto 在提供 repo 时查详情，否则搜索。"}},"required":["package_name"],"additionalProperties":false}), |args| async move { official_package_query(args).await }));
     registry.register(ToolSpec::new(
         "aur_check_status",
         "Check Arch Linux / AUR service status with detailed incident, degradation, and downtime info.",
@@ -23,13 +23,13 @@ pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
     let state_dir = paths.state_dir.clone();
     registry.register(ToolSpec::new(
         "archlinux_news",
-        "Fetch recent Arch Linux news. Shows latest articles from archlinux.org news feed. Articles are automatically marked as seen after each query, so subsequent calls show which articles are new since last check. / 获取 Arch Linux 最新新闻。每次查询后自动标记已读，后续调用会标注新增文章。",
+        "获取 Arch Linux 最新新闻。每次查询后自动标记已读，后续调用会标注新增文章。",
         json!({
             "type": "object",
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of articles to return (1-20). Defaults to 10. / 返回文章数量上限（1-20），默认 10。"
+                    "description": "返回文章数量上限（1-20），默认 10。"
                 }
             },
             "additionalProperties": false

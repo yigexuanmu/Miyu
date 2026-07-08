@@ -136,7 +136,7 @@ impl OpenAiCompatibleClient {
         }
 
         let dsml = dsml_enabled_for(&self.provider);
-        let mut buffer = String::new();
+        let mut buffer = Utf8LineBuffer::default();
         let mut content = String::new();
         let mut content_emitted = 0usize;
         let mut reasoning = String::new();
@@ -146,10 +146,7 @@ impl OpenAiCompatibleClient {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(index) = buffer.find('\n') {
-                let line = buffer[..index].trim_end_matches('\r').to_string();
-                buffer.drain(..=index);
+            for line in buffer.push(&chunk)? {
                 if let Some(done) = handle_sse_line(
                     &line,
                     &mut content,
@@ -172,9 +169,9 @@ impl OpenAiCompatibleClient {
                 }
             }
         }
-        if !buffer.trim().is_empty() {
+        for line in buffer.finish()? {
             let _ = handle_sse_line(
-                buffer.trim_end_matches('\r'),
+                &line,
                 &mut content,
                 &mut content_emitted,
                 &mut reasoning,
@@ -228,11 +225,11 @@ impl OpenAiCompatibleClient {
 
         let dsml = dsml_enabled_for(&self.provider);
         let mut state = AnthropicStreamState::default();
-        let mut buffer = SseBuffer::default();
+        let mut buffer = SseDataBuffer::default();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            for data in buffer.push(&String::from_utf8_lossy(&chunk))? {
+            for data in buffer.push(&chunk)? {
                 if handle_anthropic_sse_data(&data, &mut state, &mut *on_chunk)? {
                     return finalize_stream_result(
                         state.content,
@@ -298,7 +295,7 @@ impl OpenAiCompatibleClient {
         }
 
         let dsml = dsml_enabled_for(&self.provider);
-        let mut buffer = String::new();
+        let mut buffer = Utf8LineBuffer::default();
         let mut content = String::new();
         let mut content_emitted = 0usize;
         let mut reasoning = String::new();
@@ -309,10 +306,7 @@ impl OpenAiCompatibleClient {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(index) = buffer.find('\n') {
-                let line = buffer[..index].trim_end_matches('\r').to_string();
-                buffer.drain(..=index);
+            for line in buffer.push(&chunk)? {
                 if handle_responses_sse_line(
                     &line,
                     &mut content,
@@ -334,6 +328,19 @@ impl OpenAiCompatibleClient {
                     .map(Some);
                 }
             }
+        }
+        for line in buffer.finish()? {
+            let _ = handle_responses_sse_line(
+                &line,
+                &mut content,
+                &mut content_emitted,
+                &mut reasoning,
+                &mut reasoning_emitted,
+                &mut usage,
+                &mut content_started,
+                &mut tool_calls,
+                &mut *on_chunk,
+            )?;
         }
         finalize_stream_result(content, reasoning, usage, tool_calls.finish(), dsml).map(Some)
     }
@@ -1147,18 +1154,54 @@ impl ToolCallAccumulator {
 }
 
 #[derive(Default)]
-struct SseBuffer {
-    buffer: String,
+struct Utf8LineBuffer {
+    buffer: Vec<u8>,
+}
+
+impl Utf8LineBuffer {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.buffer.drain(..=index).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            lines.push(
+                std::str::from_utf8(&line)
+                    .context("invalid utf-8 in streaming response")?
+                    .to_string(),
+            );
+        }
+        Ok(lines)
+    }
+
+    fn finish(mut self) -> Result<Vec<String>> {
+        if self.buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Ok(Vec::new());
+        }
+        if self.buffer.last() == Some(&b'\r') {
+            self.buffer.pop();
+        }
+        Ok(vec![std::str::from_utf8(&self.buffer)
+            .context("invalid utf-8 in streaming response")?
+            .to_string()])
+    }
+}
+
+#[derive(Default)]
+struct SseDataBuffer {
+    lines: Utf8LineBuffer,
     data_lines: Vec<String>,
 }
 
-impl SseBuffer {
-    fn push(&mut self, text: &str) -> Result<Vec<String>> {
-        self.buffer.push_str(text);
+impl SseDataBuffer {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         let mut events = Vec::new();
-        while let Some(index) = self.buffer.find('\n') {
-            let line = self.buffer[..index].trim_end_matches('\r').to_string();
-            self.buffer.drain(..=index);
+        for line in self.lines.push(bytes)? {
             if let Some(event) = self.push_line(&line) {
                 events.push(event);
             }
@@ -1168,8 +1211,7 @@ impl SseBuffer {
 
     fn finish(mut self) -> Result<Vec<String>> {
         let mut events = Vec::new();
-        if !self.buffer.trim().is_empty() {
-            let line = self.buffer.trim_end_matches('\r').to_string();
+        for line in std::mem::take(&mut self.lines).finish()? {
             if let Some(event) = self.push_line(&line) {
                 events.push(event);
             }
@@ -1985,6 +2027,30 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].kind, ChatStreamKind::Reasoning);
         assert_eq!(chunks[0].text, "先想一下");
+    }
+
+    #[test]
+    fn sse_buffer_preserves_utf8_split_across_byte_chunks() {
+        let line = r#"data: {"choices":[{"delta":{"content":"等","tool_calls":null}}]}"#;
+        let split = line.find("等").unwrap() + 1;
+        let mut buffer = Utf8LineBuffer::default();
+
+        assert!(buffer.push(&line.as_bytes()[..split]).unwrap().is_empty());
+        let lines = buffer.push(&line.as_bytes()[split..]).unwrap();
+
+        assert!(lines.is_empty());
+        assert_eq!(buffer.finish().unwrap(), vec![line]);
+    }
+
+    #[test]
+    fn previous_lossy_chunk_decode_corrupts_split_utf8() {
+        let text = "等";
+        let mut decoded = String::new();
+
+        decoded.push_str(&String::from_utf8_lossy(&text.as_bytes()[..1]));
+        decoded.push_str(&String::from_utf8_lossy(&text.as_bytes()[1..]));
+
+        assert_eq!(decoded, "���");
     }
 
     #[test]

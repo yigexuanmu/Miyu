@@ -10,7 +10,7 @@ const TOOL_DISPLAY_NAME: &str = "查询是否能在Linux上玩";
 const PAGE_SIZE: usize = 24;
 const MAX_LIMIT: usize = 10;
 
-const TOOL_DESC: &str = "查询 caniplayonlinux.com 的实时 Linux 游戏兼容性信息。适用于用户询问某个游戏是否能在 Linux 上玩、是否可通过 Proton 运行、是否 Steam Deck Verified、推荐 Proton 版本、是否有已知 Linux 问题或修复方法的场景。该工具只读抓取网页并返回结构化结果，包括标题、来源链接、兼容性结论、Proton 推荐、Steam Deck 状态、摘要、备注、已知问题、修复建议和验证时间等可用字段。返回内容来自第三方站点实时解析；不要编造缺失字段，未返回的信息应视为未知。允许子代理调用。 / Search caniplayonlinux.com for live Linux game compatibility information. Use this when the user asks whether a game runs on Linux, works with Proton, is Steam Deck Verified, needs a specific Proton version, or has known Linux issues/fixes. Read-only live lookup; missing fields are unknown and must not be invented. Subagents may call this tool.";
+const TOOL_DESC: &str = "查询 caniplayonlinux.com 的实时 Linux 游戏兼容性信息。适用于用户询问某个游戏是否能在 Linux 上玩、是否可通过 Proton 运行、是否 Steam Deck Verified、推荐 Proton 版本、是否有已知 Linux 问题或修复方法的场景。该工具只读抓取网页并返回结构化结果，包括标题、来源链接、兼容性结论、Proton 推荐、Steam Deck 状态、摘要、备注、已知问题、修复建议和验证时间等可用字段。返回内容来自第三方站点实时解析；不要编造缺失字段，未返回的信息应视为未知。允许子代理调用。";
 
 #[derive(Clone, Debug)]
 struct GameEntry {
@@ -38,11 +38,11 @@ pub fn create_toolspec() -> ToolSpec {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Game title or partial title to search on caniplayonlinux.com. / 要查询的游戏名称或部分标题。"
+                    "description": "要查询的游戏名称或部分标题。"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of matching games to return, default 5, max 10. / 最多返回的匹配结果数，默认 5，最大 10。"
+                    "description": "最多返回的匹配结果数，默认 5，最大 10。"
                 }
             },
             "required": ["query"],

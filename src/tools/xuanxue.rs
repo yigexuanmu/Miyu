@@ -188,7 +188,7 @@ pub fn register(registry: &mut ToolRegistry) {
     ));
     registry.register(ToolSpec::new(
         "draw_fortune_lot",
-        "Run a random fortune divination and return the fortune level plus meaning. Use for fortune, luck, or mysticism requests. / 随机进行一次吉凶占，返回吉凶等级和含义。适用于占卜吉凶、运势、玄学相关请求。工具只负责随机给出吉凶，不负责解释。",
+        "随机进行一次吉凶占，返回吉凶等级和含义。适用于占卜吉凶、运势、玄学相关请求。工具只负责随机给出吉凶，不负责解释。",
         empty_parameters(),
         |_| async {
             let (luck, meaning) = choice(FORTUNE_DIVINATIONS);
@@ -197,13 +197,13 @@ pub fn register(registry: &mut ToolRegistry) {
     ));
     registry.register(ToolSpec::new(
         "roll_dice",
-        "Roll dice and return each roll plus totals. Use for dice rolling, random tabletop checks, d6/d20, or 掷骰子 requests. / 掷骰子并返回每颗骰子点数和总和。适用于骰子、跑团检定、d6/d20 等请求。",
+        "掷骰子并返回每颗骰子点数和总和。适用于骰子、跑团检定、d6/d20 等请求。",
         json!({
             "type": "object",
             "properties": {
-                "count": { "type": "integer", "description": "Number of dice, default 1, max 100. / 骰子数量，默认 1，最多 100。" },
-                "sides": { "type": "integer", "description": "Sides per die, default 6, max 1000. / 每颗骰子的面数，默认 6，最多 1000。" },
-                "modifier": { "type": "integer", "description": "Optional total modifier. / 可选总和修正值。" }
+                "count": { "type": "integer", "description": "骰子数量，默认 1，最多 100。" },
+                "sides": { "type": "integer", "description": "每颗骰子的面数，默认 6，最多 1000。" },
+                "modifier": { "type": "integer", "description": "可选总和修正值。" }
             },
             "additionalProperties": false
         }),

@@ -324,6 +324,9 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
     }
+    if config.plugins.vision.enabled {
+        vision::register(&mut registry, config.clone(), paths.clone(), true);
+    }
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
     }
