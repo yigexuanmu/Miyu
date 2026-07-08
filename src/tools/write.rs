@@ -28,11 +28,11 @@ pub fn register(registry: &mut ToolRegistry) {
             "required": ["path", "content"],
             "additionalProperties": false
         }),
-        |args, progress| async move { write_file(args, progress) },
+        |args, progress| async move { write_file(args, progress).await },
     ).writes());
 }
 
-fn write_file(args: Value, progress: ToolProgress) -> Result<String> {
+async fn write_file(args: Value, progress: ToolProgress) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let content = args
         .get("content")
@@ -57,6 +57,7 @@ fn write_file(args: Value, progress: ToolProgress) -> Result<String> {
     let config = get_diff_config_or_default();
     if config.enabled && existed {
         progress.report("__external_output__");
+        tokio::task::yield_now().await;
         let _ = diff_display::print_file_diff(&old_content, &content, &path.display().to_string(), &config);
     }
 
@@ -101,14 +102,15 @@ fn expand_path(value: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn write_creates_new_file() {
+    #[tokio::test]
+    async fn write_creates_new_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("new.txt");
         let result = write_file(json!({
             "path": path.display().to_string(),
             "content": "hello world\n"
         }), ToolProgress::default())
+        .await
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
@@ -116,8 +118,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
     }
 
-    #[test]
-    fn write_overwrites_existing_file() {
+    #[tokio::test]
+    async fn write_overwrites_existing_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("existing.txt");
         std::fs::write(&path, "old content\n").unwrap();
@@ -125,6 +127,7 @@ mod tests {
             "path": path.display().to_string(),
             "content": "new content\n"
         }), ToolProgress::default())
+        .await
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
@@ -132,14 +135,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content\n");
     }
 
-    #[test]
-    fn write_creates_parent_dirs() {
+    #[tokio::test]
+    async fn write_creates_parent_dirs() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("a/b/c/file.txt");
         let result = write_file(json!({
             "path": path.display().to_string(),
             "content": "nested\n"
         }), ToolProgress::default())
+        .await
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);

@@ -37,11 +37,11 @@ pub fn register(registry: &mut ToolRegistry) {
             "required": ["path", "old_string", "new_string"],
             "additionalProperties": false
         }),
-        |args, progress| async move { edit_string(args, progress) },
+        |args, progress| async move { edit_string(args, progress).await },
     ).writes());
 }
 
-fn edit_string(args: Value, progress: ToolProgress) -> Result<String> {
+async fn edit_string(args: Value, progress: ToolProgress) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let old_string = args
         .get("old_string")
@@ -87,6 +87,7 @@ fn edit_string(args: Value, progress: ToolProgress) -> Result<String> {
     let config = get_diff_config_or_default();
     if config.enabled {
         progress.report("__external_output__");
+        tokio::task::yield_now().await;
         let _ = diff_display::print_file_diff(&original, &updated, &path.display().to_string(), &config);
     }
 
@@ -148,8 +149,8 @@ fn expand_path(value: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn replace_single_match() {
+    #[tokio::test]
+    async fn replace_single_match() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "foo bar baz\n").unwrap();
@@ -158,14 +159,15 @@ mod tests {
             "old_string": "bar",
             "new_string": "BAR"
         }), ToolProgress::default())
+        .await
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["replacements"], 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo BAR baz\n");
     }
 
-    #[test]
-    fn replace_all_matches() {
+    #[tokio::test]
+    async fn replace_all_matches() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "foo foo foo\n").unwrap();
@@ -175,14 +177,15 @@ mod tests {
             "new_string": "qux",
             "replace_all": true
         }), ToolProgress::default())
+        .await
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["replacements"], 3);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "qux qux qux\n");
     }
 
-    #[test]
-    fn not_found_errors() {
+    #[tokio::test]
+    async fn not_found_errors() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "hello world\n").unwrap();
@@ -190,12 +193,12 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "nonexistent",
             "new_string": "found"
-        }), ToolProgress::default());
+        }), ToolProgress::default()).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn multiple_matches_without_replace_all_errors() {
+    #[tokio::test]
+    async fn multiple_matches_without_replace_all_errors() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "a a a\n").unwrap();
@@ -203,12 +206,12 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "a",
             "new_string": "b"
-        }), ToolProgress::default());
+        }), ToolProgress::default()).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn identical_strings_error() {
+    #[tokio::test]
+    async fn identical_strings_error() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "same\n").unwrap();
@@ -216,12 +219,12 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "same",
             "new_string": "same"
-        }), ToolProgress::default());
+        }), ToolProgress::default()).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn multiline_replacement() {
+    #[tokio::test]
+    async fn multiline_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.txt");
         std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
@@ -230,6 +233,7 @@ mod tests {
             "old_string": "line2",
             "new_string": "LINE TWO\nEXTRA"
         }), ToolProgress::default())
+        .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
