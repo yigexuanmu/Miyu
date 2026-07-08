@@ -32,8 +32,8 @@
           version = "0.1.10";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [
-            pkgs.pkg-config
             pkgs.alsa-lib
             pkgs.openssl
             pkgs.sqlite
