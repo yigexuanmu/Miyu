@@ -70,3 +70,7 @@ cargo build --release
 ```bash
 miyu "帮我修改 README.md"
 ```
+
+## 致谢
+
+- [SHORiN-KiWATA/Miyu](https://github.com/SHORiN-KiWATA/Miyu) - 原项目
