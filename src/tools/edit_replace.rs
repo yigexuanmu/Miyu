@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{ToolProgress, ToolRegistry, ToolSpec};
 use crate::diff_config::get_diff_config_or_default;
 use crate::diff_display;
 use crate::i18n::text as t;
@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 pub fn register(registry: &mut ToolRegistry) {
-    registry.register(ToolSpec::new(
+    registry.register(ToolSpec::new_with_progress(
         "edit_string",
         t(
             "Edit a file by replacing an exact string match. Fails if oldString is not found or found multiple times (unless replaceAll). Must differ from newString.",
@@ -37,11 +37,11 @@ pub fn register(registry: &mut ToolRegistry) {
             "required": ["path", "old_string", "new_string"],
             "additionalProperties": false
         }),
-        |args| async move { edit_string(args) },
+        |args, progress| async move { edit_string(args, progress) },
     ).writes());
 }
 
-fn edit_string(args: Value) -> Result<String> {
+fn edit_string(args: Value, progress: ToolProgress) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let old_string = args
         .get("old_string")
@@ -86,6 +86,7 @@ fn edit_string(args: Value) -> Result<String> {
 
     let config = get_diff_config_or_default();
     if config.enabled {
+        progress.report("__external_output__");
         let _ = diff_display::print_file_diff(&original, &updated, &path.display().to_string(), &config);
     }
 
@@ -156,7 +157,7 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "bar",
             "new_string": "BAR"
-        }))
+        }), ToolProgress::default())
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["replacements"], 1);
@@ -173,7 +174,7 @@ mod tests {
             "old_string": "foo",
             "new_string": "qux",
             "replace_all": true
-        }))
+        }), ToolProgress::default())
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["replacements"], 3);
@@ -189,7 +190,7 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "nonexistent",
             "new_string": "found"
-        }));
+        }), ToolProgress::default());
         assert!(result.is_err());
     }
 
@@ -202,7 +203,7 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "a",
             "new_string": "b"
-        }));
+        }), ToolProgress::default());
         assert!(result.is_err());
     }
 
@@ -215,7 +216,7 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "same",
             "new_string": "same"
-        }));
+        }), ToolProgress::default());
         assert!(result.is_err());
     }
 
@@ -228,7 +229,7 @@ mod tests {
             "path": path.display().to_string(),
             "old_string": "line2",
             "new_string": "LINE TWO\nEXTRA"
-        }))
+        }), ToolProgress::default())
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

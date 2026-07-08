@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{ToolProgress, ToolRegistry, ToolSpec};
 use crate::diff_config::get_diff_config_or_default;
 use crate::diff_display;
 use crate::i18n::text as t;
@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 pub fn register(registry: &mut ToolRegistry) {
-    registry.register(ToolSpec::new(
+    registry.register(ToolSpec::new_with_progress(
         "write_file",
         t(
             "Write content to a file, creating it if it does not exist or overwriting if it does. Supports absolute, workspace-relative, and ~/ paths.",
@@ -28,11 +28,11 @@ pub fn register(registry: &mut ToolRegistry) {
             "required": ["path", "content"],
             "additionalProperties": false
         }),
-        |args| async move { write_file(args) },
+        |args, progress| async move { write_file(args, progress) },
     ).writes());
 }
 
-fn write_file(args: Value) -> Result<String> {
+fn write_file(args: Value, progress: ToolProgress) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let content = args
         .get("content")
@@ -56,6 +56,7 @@ fn write_file(args: Value) -> Result<String> {
 
     let config = get_diff_config_or_default();
     if config.enabled && existed {
+        progress.report("__external_output__");
         let _ = diff_display::print_file_diff(&old_content, &content, &path.display().to_string(), &config);
     }
 
@@ -107,7 +108,7 @@ mod tests {
         let result = write_file(json!({
             "path": path.display().to_string(),
             "content": "hello world\n"
-        }))
+        }), ToolProgress::default())
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
@@ -123,7 +124,7 @@ mod tests {
         let result = write_file(json!({
             "path": path.display().to_string(),
             "content": "new content\n"
-        }))
+        }), ToolProgress::default())
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
@@ -138,7 +139,7 @@ mod tests {
         let result = write_file(json!({
             "path": path.display().to_string(),
             "content": "nested\n"
-        }))
+        }), ToolProgress::default())
         .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
