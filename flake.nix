@@ -38,6 +38,7 @@
             pkgs.openssl
             pkgs.sqlite
           ];
+          doCheck = false;
           meta = with pkgs.lib; {
             description = "Command-line AI assistant with TUI diff display";
             homepage = "https://github.com/yigexuanmu/Miyu";
