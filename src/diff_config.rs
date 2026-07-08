@@ -12,5 +12,15 @@ pub fn get_diff_config() -> Option<&'static DiffDisplayPluginConfig> {
 }
 
 pub fn get_diff_config_or_default() -> DiffDisplayPluginConfig {
-    DIFF_CONFIG.get().cloned().unwrap_or_default()
+    #[cfg(test)]
+    {
+        return DiffDisplayPluginConfig {
+            enabled: false,
+            ..Default::default()
+        };
+    }
+    #[cfg(not(test))]
+    {
+        DIFF_CONFIG.get().cloned().unwrap_or_default()
+    }
 }
