@@ -1,1 +1,0 @@
-异环是一款类GTA玩法的二次元开放世界游戏。在Linux运行需要使用DW-proton兼容层，使用lutris之类的wine前缀安装或者在steam添加非steam游戏都可以。

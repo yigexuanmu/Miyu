@@ -1433,6 +1433,7 @@ async fn run_chat_with_images(
 ) -> Result<()> {
     AppConfig::init_files(paths)?;
     let config = AppConfig::load_or_default(paths)?;
+    crate::diff_config::init_diff_config(config.plugins.diff_display.clone());
     let state = StateStore::new(paths)?;
     state.init_files()?;
     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
@@ -1537,6 +1538,7 @@ async fn run_chat_with_options(
     }
     AppConfig::init_files(paths)?;
     let config = AppConfig::load_or_default(paths)?;
+    crate::diff_config::init_diff_config(config.plugins.diff_display.clone());
     let state = StateStore::new(paths)?;
     state.init_files()?;
     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
@@ -1604,6 +1606,7 @@ async fn handle_post_turn_overflow(
 async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
+    crate::diff_config::init_diff_config(config.plugins.diff_display.clone());
     let state = StateStore::new(paths)?;
     state.init_files()?;
     let mut client = OpenAiCompatibleClient::from_config(&config, paths)?;

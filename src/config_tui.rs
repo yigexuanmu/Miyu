@@ -97,12 +97,12 @@ fn run_main_menu(
 fn edit_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
     let mut selected = 0usize;
     loop {
-        let count = plugin_names().len();
+        let count = all_plugin_names(config).len();
         draw_plugin_menu(stdout, config, selected)?;
         match read_key()? {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(count - 1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(count.saturating_sub(1)),
             KeyCode::Char(' ') => toggle_plugin(config, selected),
             KeyCode::Enter | KeyCode::Char('i') => edit_plugin_detail(stdout, config, selected)?,
             _ => {}
@@ -133,7 +133,7 @@ fn draw_plugin_menu(stdout: &mut io::Stdout, config: &AppConfig, selected: usize
         )),
         SetAttribute(Attribute::Reset)
     )?;
-    let plugins = plugin_names();
+    let plugins = all_plugin_names(config);
     let visible_rows = height.saturating_sub(6) as usize;
     let start = selected.saturating_sub(visible_rows.saturating_sub(1));
     for row in 0..visible_rows {
@@ -141,7 +141,7 @@ fn draw_plugin_menu(stdout: &mut io::Stdout, config: &AppConfig, selected: usize
         if index >= plugins.len() {
             break;
         }
-        let (_, name, description) = plugins[index];
+        let (_, name, description) = &plugins[index];
         let state = if plugin_enabled(config, index) {
             "[ON]"
         } else {
@@ -170,8 +170,8 @@ fn plugin_row(state: &str, name: &str, description: &str, width: usize) -> Strin
     fixed + &truncate(description, remaining)
 }
 
-fn plugin_names() -> [(&'static str, &'static str, &'static str); 13] {
-    [
+fn plugin_names() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
         ("web", "网络搜索", "搜索 API 与脚本 fallback"),
         ("deep_research", "深度研究", "长任务研究并输出 Markdown"),
         ("vision", "识图", "图片理解和终端预览"),
@@ -189,65 +189,132 @@ fn plugin_names() -> [(&'static str, &'static str, &'static str); 13] {
             "Linux 游戏兼容",
             "Proton/反作弊/兼容性查询",
         ),
+        (
+            "diff_display",
+            "变更显示",
+            "文件修改时显示 TUI Diff 视图",
+        ),
     ]
 }
 
+fn dynamic_plugin_names(config: &AppConfig) -> Vec<(String, String, String)> {
+    config
+        .plugins
+        .dynamic
+        .iter()
+        .map(|(id, _p)| {
+            (
+                id.clone(),
+                id.clone(),
+                format!("Dynamic plugin: {}", id),
+            )
+        })
+        .collect()
+}
+
+fn all_plugin_names(config: &AppConfig) -> Vec<(String, String, String)> {
+    let mut result: Vec<(String, String, String)> = plugin_names()
+        .into_iter()
+        .map(|(id, name, desc)| (id.to_string(), name.to_string(), desc.to_string()))
+        .collect();
+    result.extend(dynamic_plugin_names(config));
+    result
+}
+
 fn plugin_enabled(config: &AppConfig, index: usize) -> bool {
-    match index {
-        0 => config.plugins.web.enabled,
-        1 => config.plugins.deep_research.enabled,
-        2 => config.plugins.vision.enabled,
-        3 => config.plugins.image_generation.enabled,
-        4 => config.plugins.web_images.enabled,
-        5 => config.plugins.print_image.enabled,
-        6 => config.plugins.memes.enabled,
-        7 => config.plugins.knowledge_base.enabled,
-        8 => config.plugins.archlinux.enabled,
-        9 => config.plugins.man.enabled,
-        10 => config.plugins.memory.enabled,
-        11 => config.plugins.package_advisor.enabled,
-        12 => {
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .enabled
+    let fixed_count = plugin_names().len();
+    if index < fixed_count {
+        match index {
+            0 => config.plugins.web.enabled,
+            1 => config.plugins.deep_research.enabled,
+            2 => config.plugins.vision.enabled,
+            3 => config.plugins.image_generation.enabled,
+            4 => config.plugins.web_images.enabled,
+            5 => config.plugins.print_image.enabled,
+            6 => config.plugins.memes.enabled,
+            7 => config.plugins.knowledge_base.enabled,
+            8 => config.plugins.archlinux.enabled,
+            9 => config.plugins.man.enabled,
+            10 => config.plugins.memory.enabled,
+            11 => config.plugins.package_advisor.enabled,
+            12 => {
+                config
+                    .plugins
+                    .deep_research_linux_game_compatibility
+                    .enabled
+            }
+            13 => config.plugins.diff_display.enabled,
+            _ => false,
         }
-        _ => false,
+    } else {
+        let dynamic_index = index - fixed_count;
+        let dynamic_plugins: Vec<_> = config.plugins.dynamic.keys().collect();
+        if let Some(id) = dynamic_plugins.get(dynamic_index) {
+            config.plugins.dynamic.get(*id).map_or(false, |p| p.enabled)
+        } else {
+            false
+        }
     }
 }
 
 fn toggle_plugin(config: &mut AppConfig, index: usize) {
     let value = !plugin_enabled(config, index);
-    match index {
-        0 => config.plugins.web.enabled = value,
-        1 => config.plugins.deep_research.enabled = value,
-        2 => config.plugins.vision.enabled = value,
-        3 => config.plugins.image_generation.enabled = value,
-        4 => config.plugins.web_images.enabled = value,
-        5 => config.plugins.print_image.enabled = value,
-        6 => config.plugins.memes.enabled = value,
-        7 => config.plugins.knowledge_base.enabled = value,
-        8 => config.plugins.archlinux.enabled = value,
-        9 => config.plugins.man.enabled = value,
-        10 => config.plugins.memory.enabled = value,
-        11 => config.plugins.package_advisor.enabled = value,
-        12 => {
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .enabled = value
+    let fixed_count = plugin_names().len();
+    if index < fixed_count {
+        match index {
+            0 => config.plugins.web.enabled = value,
+            1 => config.plugins.deep_research.enabled = value,
+            2 => config.plugins.vision.enabled = value,
+            3 => config.plugins.image_generation.enabled = value,
+            4 => config.plugins.web_images.enabled = value,
+            5 => config.plugins.print_image.enabled = value,
+            6 => config.plugins.memes.enabled = value,
+            7 => config.plugins.knowledge_base.enabled = value,
+            8 => config.plugins.archlinux.enabled = value,
+            9 => config.plugins.man.enabled = value,
+            10 => config.plugins.memory.enabled = value,
+            11 => config.plugins.package_advisor.enabled = value,
+            12 => {
+                config
+                    .plugins
+                    .deep_research_linux_game_compatibility
+                    .enabled = value
+            }
+            13 => config.plugins.diff_display.enabled = value,
+            _ => {}
         }
-        _ => {}
+    } else {
+        let dynamic_index = index - fixed_count;
+        let dynamic_plugins: Vec<_> = config.plugins.dynamic.keys().cloned().collect();
+        if let Some(id) = dynamic_plugins.get(dynamic_index) {
+            if let Some(plugin_config) = config.plugins.dynamic.get_mut(id) {
+                plugin_config.enabled = value;
+            }
+        }
     }
 }
 
 fn edit_plugin_detail(stdout: &mut io::Stdout, config: &mut AppConfig, index: usize) -> Result<()> {
-    let title = format!(" PLUGIN: {} ", plugin_names()[index].1);
-    let mut fields = plugin_fields(config, index);
-    if !run_form(stdout, &title, &mut fields)? {
-        return Ok(());
+    let plugins = all_plugin_names(config);
+    if let Some((id, name, _)) = plugins.get(index) {
+        let title = format!(" PLUGIN: {} ", name);
+        let fixed_count = plugin_names().len();
+        let mut fields = if index < fixed_count {
+            plugin_fields(config, index)
+        } else {
+            dynamic_plugin_fields(config, id)
+        };
+        if !run_form(stdout, &title, &mut fields)? {
+            return Ok(());
+        }
+        if index < fixed_count {
+            apply_plugin_fields(config, index, &fields)
+        } else {
+            apply_dynamic_plugin_fields(config, id, &fields)
+        }
+    } else {
+        Ok(())
     }
-    apply_plugin_fields(config, index, &fields)
 }
 
 fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
@@ -557,6 +624,18 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                     .to_string(),
             ),
         ],
+        13 => vec![
+            Field::boolean("启用", config.plugins.diff_display.enabled),
+            Field::new(
+                "上下文行数",
+                config.plugins.diff_display.context_lines.to_string(),
+            ),
+            Field::boolean("显示文件头", config.plugins.diff_display.show_file_header),
+            Field::new(
+                "最大显示行数",
+                config.plugins.diff_display.max_lines.to_string(),
+            ),
+        ],
         _ => vec![Field::boolean("启用", plugin_enabled(config, index))],
     }
 }
@@ -703,11 +782,44 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
                 .deep_research_linux_game_compatibility
                 .max_tool_steps = fields[1].value.trim().parse::<usize>()?.clamp(1, 500);
         }
+        13 => {
+            config.plugins.diff_display.enabled = parse_bool_field(&fields[0].value)?;
+            config.plugins.diff_display.context_lines =
+                fields[1].value.trim().parse::<usize>()?.clamp(1, 20);
+            config.plugins.diff_display.show_file_header =
+                parse_bool_field(&fields[2].value)?;
+            config.plugins.diff_display.max_lines =
+                fields[3].value.trim().parse::<usize>()?.clamp(10, 200);
+        }
         _ => {
             let value = parse_bool_field(&fields[0].value)?;
             if plugin_enabled(config, index) != value {
                 toggle_plugin(config, index);
             }
+        }
+    }
+    Ok(())
+}
+
+fn dynamic_plugin_fields(config: &AppConfig, id: &str) -> Vec<Field> {
+    if let Some(plugin_config) = config.plugins.dynamic.get(id) {
+        let mut fields = vec![Field::boolean("启用", plugin_config.enabled)];
+        for key in plugin_config.config.keys() {
+            let value = plugin_config.config.get(key).cloned().unwrap_or_default();
+            fields.push(Field::new("动态配置项", value));
+        }
+        fields
+    } else {
+        vec![Field::boolean("启用", true)]
+    }
+}
+
+fn apply_dynamic_plugin_fields(config: &mut AppConfig, id: &str, fields: &[Field]) -> Result<()> {
+    if let Some(plugin_config) = config.plugins.dynamic.get_mut(id) {
+        plugin_config.enabled = parse_bool_field(&fields[0].value)?;
+        for (i, field) in fields.iter().skip(1).enumerate() {
+            let key = format!("field_{}", i);
+            plugin_config.config.insert(key, field.value.clone());
         }
     }
     Ok(())

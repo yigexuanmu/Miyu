@@ -1,4 +1,6 @@
 use super::{ToolRegistry, ToolSpec};
+use crate::diff_config::get_diff_config_or_default;
+use crate::diff_display;
 use crate::i18n::text as t;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -81,6 +83,11 @@ fn edit_string(args: Value) -> Result<String> {
     } else {
         original.replacen(old_string, new_string, 1)
     };
+
+    let config = get_diff_config_or_default();
+    if config.enabled {
+        let _ = diff_display::print_file_diff(&original, &updated, &path.display().to_string(), &config);
+    }
 
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent)?;

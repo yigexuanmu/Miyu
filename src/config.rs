@@ -264,6 +264,39 @@ pub struct PluginsConfig {
     pub diagnostics: DiagnosticsPluginConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub diff_display: DiffDisplayPluginConfig,
+    #[serde(default)]
+    pub dynamic: HashMap<String, DynamicPluginConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffDisplayPluginConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_diff_display_context_lines")]
+    pub context_lines: usize,
+    #[serde(default = "default_true")]
+    pub show_file_header: bool,
+    #[serde(default = "default_diff_display_max_lines")]
+    pub max_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicPluginConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+}
+
+impl Default for DynamicPluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +602,19 @@ impl Default for PluginsConfig {
             deep_research_linux_game_compatibility: LinuxGameCompatibilityConfig::default(),
             diagnostics: DiagnosticsPluginConfig::default(),
             memory: MemoryConfig::default(),
+            diff_display: DiffDisplayPluginConfig::default(),
+            dynamic: HashMap::new(),
+        }
+    }
+}
+
+impl Default for DiffDisplayPluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            context_lines: default_diff_display_context_lines(),
+            show_file_header: default_true(),
+            max_lines: default_diff_display_max_lines(),
         }
     }
 }
@@ -1696,6 +1742,14 @@ fn default_trim_batch_ratio() -> f32 {
 
 fn default_on_overflow() -> String {
     "pop".to_string()
+}
+
+fn default_diff_display_context_lines() -> usize {
+    3
+}
+
+fn default_diff_display_max_lines() -> usize {
+    50
 }
 
 #[cfg(unix)]

@@ -1,4 +1,6 @@
 use super::{ToolRegistry, ToolSpec};
+use crate::diff_config::get_diff_config_or_default;
+use crate::diff_display;
 use crate::i18n::text as t;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -39,12 +41,23 @@ fn write_file(args: Value) -> Result<String> {
     let content = content.to_string();
 
     let existed = path.exists();
+    let old_content = if existed {
+        std::fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     let temp = tempfile::NamedTempFile::new_in(parent)?;
     std::fs::write(temp.path(), content.as_bytes())?;
     temp.persist(&path)?;
+
+    let config = get_diff_config_or_default();
+    if config.enabled && existed {
+        let _ = diff_display::print_file_diff(&old_content, &content, &path.display().to_string(), &config);
+    }
 
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,

@@ -1,1 +1,0 @@
-shorin-dms-niri桌面提供了shorindms脚本，shorin-niri桌面提供了shorinniri脚本，以此类推。更新对应的aur包之后用对应的脚本进行更新即可。

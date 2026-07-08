@@ -262,6 +262,10 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.tools.loading_mode == "lazy" {
         load_tools::register(&mut registry);
     }
+
+    // Register dynamic plugins
+    register_dynamic_plugins(&mut registry, config);
+
     registry
 }
 
@@ -324,4 +328,24 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
     }
     registry
+}
+
+fn register_dynamic_plugins(registry: &mut ToolRegistry, config: &AppConfig) {
+    use crate::plugin::registry::PluginRegistry;
+    use crate::plugin::builtin::register_builtin_plugins;
+
+    let mut plugin_registry = PluginRegistry::new();
+    register_builtin_plugins(&mut plugin_registry);
+
+    // Register enabled dynamic plugins from config
+    for (id, plugin_config) in &config.plugins.dynamic {
+        if plugin_config.enabled {
+            if let Some(plugin) = plugin_registry.get_plugin(id) {
+                let plugin = plugin.read().unwrap();
+                if let Err(e) = plugin.register_tools(registry) {
+                    eprintln!("Warning: Failed to register dynamic plugin {}: {}", id, e);
+                }
+            }
+        }
+    }
 }

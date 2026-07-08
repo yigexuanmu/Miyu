@@ -1,1 +1,0 @@
-AUR上有一个shorin制作的长截图工具，如果你是Niri、Hyprland之类的Wayland合成器的话可以直接安装这个包：wl-longshot-git
