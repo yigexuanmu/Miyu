@@ -32,25 +32,75 @@
 }
 ```
 
-## 安装
+## NixOS 安装
 
-### NixOS
+### 方式一：systemPackages (全局安装)
+
+在 `configuration.nix` 中添加：
+
+```nix
+{ config, pkgs, ... }:
+
+let
+  miyu = pkgs.callPackage ./miyu.nix { };
+in
+{
+  environment.systemPackages = [ miyu ];
+}
+```
+
+创建 `miyu.nix`：
+
+```nix
+{ rustPlatform, pkg-config, alsa-lib, openssl, sqlite }:
+
+rustPlatform.buildRustPackage {
+  pname = "miyu";
+  version = "0.1.10";
+  src = ./.;
+  cargoLock.lockFile = ./Cargo.lock;
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ alsa-lib openssl sqlite ];
+  doCheck = false;
+}
+```
+
+### 方式二：Home Manager (用户级安装)
+
+在 `home.nix` 中添加：
+
+```nix
+{ config, pkgs, ... }:
+
+let
+  miyu = pkgs.callPackage ./miyu.nix { };
+in
+{
+  home.packages = [ miyu ];
+}
+```
+
+### 方式三：nix profile
+
+```bash
+# 克隆并构建
+git clone https://github.com/yigexuanmu/Miyu.git
+cd Miyu
+nix build
+
+# 添加到 profile
+nix profile install ./result
+```
+
+### 方式四：临时使用
 
 ```bash
 git clone https://github.com/yigexuanmu/Miyu.git
 cd Miyu
-
-# 进入开发环境
-nix develop
-
-# 构建
-nix build
-
-# 运行
-./result/bin/miyu
+nix run
 ```
 
-### 手动编译
+## 手动编译
 
 ```bash
 # 安装依赖 (Arch Linux)
