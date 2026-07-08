@@ -34,83 +34,42 @@
 
 ## NixOS 安装
 
-### 方式一：systemPackages (全局安装)
-
-在 `configuration.nix` 中添加：
-
-```nix
-{ config, pkgs, ... }:
-
-let
-  miyu = pkgs.callPackage ./miyu.nix { };
-in
-{
-  environment.systemPackages = [ miyu ];
-}
-```
-
-创建 `miyu.nix`：
-
-```nix
-{ rustPlatform, pkg-config, alsa-lib, openssl, sqlite }:
-
-rustPlatform.buildRustPackage {
-  pname = "miyu";
-  version = "0.1.10";
-  src = ./.;
-  cargoLock.lockFile = ./Cargo.lock;
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ alsa-lib openssl sqlite ];
-  doCheck = false;
-}
-```
-
-### 方式二：Home Manager (用户级安装)
+### Home Manager
 
 在 `home.nix` 中添加：
 
 ```nix
-{ config, pkgs, ... }:
-
-let
-  miyu = pkgs.callPackage ./miyu.nix { };
-in
 {
-  home.packages = [ miyu ];
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    miyu.url = "github:yigexuanmu/Miyu";
+  };
+
+  outputs = { nixpkgs, home-manager, miyu, ... }:
+  {
+    home.packages = [ miyu.packages.x86_64-linux.default ];
+  };
 }
 ```
 
-### 方式三：nix profile
+### configuration.nix (全局)
 
-```bash
-# 克隆并构建
-git clone https://github.com/yigexuanmu/Miyu.git
-cd Miyu
-nix build
+```nix
+{ config, pkgs, ... }:
 
-# 添加到 profile
-nix profile install ./result
+let
+  miyu = builtins.getFlake "github:yigexuanmu/Miyu";
+in
+{
+  environment.systemPackages = [ miyu.packages.x86_64-linux.default ];
+}
 ```
 
-### 方式四：临时使用
+### 临时使用
 
 ```bash
-git clone https://github.com/yigexuanmu/Miyu.git
-cd Miyu
-nix run
-```
-
-## 手动编译
-
-```bash
-# 安装依赖 (Arch Linux)
-sudo pacman -S pkg-config alsa-lib openssl sqlite
-
-# 编译
-cargo build --release
-
-# 运行
-./target/release/miyu
+nix run github:yigexuanmu/Miyu
 ```
 
 ## 致谢
