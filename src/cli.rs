@@ -1546,9 +1546,34 @@ fn run_clipboard_paste(paths: &MiyuPaths) -> Result<()> {
             io::stdout().flush()?;
             Ok(())
         }
+        Ok(crate::clipboard::ClipboardContent::Text(text)) => {
+            if should_summarize_pasted_text(&text) {
+                let index = shell_pasted_text_index(&paths.cache_dir, &text)?;
+                let placeholder = pasted_text_placeholder(index, pasted_text_line_count(&text));
+                print!("{}", placeholder);
+            } else {
+                print!("{}", text);
+            }
+            io::stdout().flush()?;
+            Ok(())
+        }
         _ => {
             std::process::exit(1);
         }
+    }
+}
+
+fn shell_pasted_text_index(cache_dir: &std::path::Path, text: &str) -> Result<usize> {
+    let dir = cache_dir.join("clipboard_texts");
+    std::fs::create_dir_all(&dir)?;
+    let mut index = 1;
+    loop {
+        let path = dir.join(format!("{index}.txt"));
+        if !path.exists() {
+            std::fs::write(path, text)?;
+            return Ok(index);
+        }
+        index += 1;
     }
 }
 
@@ -1583,6 +1608,7 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
         );
     }
 
+    let message = expand_shell_pasted_text_placeholders(paths, &message)?;
     let (clean_message, pasted_images) = extract_image_placeholders(&message);
 
     let result = if pasted_images.is_empty() {
@@ -1595,6 +1621,29 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
         println!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
     }
     result
+}
+
+fn expand_shell_pasted_text_placeholders(paths: &MiyuPaths, message: &str) -> Result<String> {
+    let placeholders = find_pasted_text_placeholders(message);
+    if placeholders.is_empty() {
+        return Ok(message.to_string());
+    }
+
+    let chars: Vec<char> = message.chars().collect();
+    let mut expanded = String::new();
+    let mut last_end = 0;
+    let dir = paths.cache_dir.join("clipboard_texts");
+    for (start, end, index) in placeholders {
+        expanded.extend(&chars[last_end..start]);
+        let path = dir.join(format!("{index}.txt"));
+        match std::fs::read_to_string(&path) {
+            Ok(text) => expanded.push_str(&text),
+            Err(_) => expanded.extend(&chars[start..end]),
+        }
+        last_end = end;
+    }
+    expanded.extend(&chars[last_end..]);
+    Ok(expanded)
 }
 
 fn extract_image_placeholders(
