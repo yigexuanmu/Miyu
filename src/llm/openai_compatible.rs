@@ -198,27 +198,29 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
-        let request = AnthropicRequest {
-            model: self.provider.default_model.clone(),
-            system: lower_anthropic_system(&messages),
-            messages: lower_anthropic_messages(messages),
-            tools: (!tools.is_empty()).then(|| lower_anthropic_tools(tools)),
-            stream: true,
-            max_tokens: self.provider.anthropic_max_tokens,
-            temperature: Some(self.provider.temperature),
-        };
-        let url = format!("{}/messages", self.provider.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request)
-            .send()
+        let mut response = self
+            .send_anthropic_request(&self.anthropic_request(messages.clone(), tools.clone(), true))
             .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            if anthropic_thinking_unsupported(status.as_u16(), &body) {
+                response = self
+                    .send_anthropic_request(&self.anthropic_request(messages, tools, false))
+                    .await?;
+                let status = response.status();
+                if status.is_success() {
+                    return self.consume_anthropic_stream(response, on_chunk).await;
+                }
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "{} ({status}): {body}",
+                    t(
+                        "anthropic messages stream request failed",
+                        "Anthropic Messages 流式请求失败"
+                    )
+                );
+            }
             bail!(
                 "{} ({status}): {body}",
                 t(
@@ -228,6 +230,50 @@ impl OpenAiCompatibleClient {
             );
         }
 
+        self.consume_anthropic_stream(response, on_chunk).await
+    }
+
+    fn anthropic_request(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        thinking: bool,
+    ) -> AnthropicRequest {
+        AnthropicRequest {
+            model: self.provider.default_model.clone(),
+            system: lower_anthropic_system(&messages),
+            messages: lower_anthropic_messages(messages),
+            tools: (!tools.is_empty()).then(|| lower_anthropic_tools(tools)),
+            stream: true,
+            max_tokens: self.provider.anthropic_max_tokens,
+            temperature: Some(self.provider.temperature),
+            thinking: thinking.then(anthropic_thinking_config),
+        }
+    }
+
+    async fn send_anthropic_request(
+        &self,
+        request: &AnthropicRequest,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/messages", self.provider.base_url.trim_end_matches('/'));
+        Ok(self
+            .client
+            .post(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(request)
+            .send()
+            .await?)
+    }
+
+    async fn consume_anthropic_stream<F>(
+        &self,
+        response: reqwest::Response,
+        on_chunk: &mut F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
         let dsml = dsml_enabled_for(&self.provider);
         let mut state = AnthropicStreamState::default();
         let mut buffer = SseDataBuffer::default();
@@ -400,6 +446,26 @@ fn claude_protocol_hint(provider: &ProviderConfig) -> &'static str {
     ""
 }
 
+fn anthropic_thinking_config() -> AnthropicThinkingConfig {
+    AnthropicThinkingConfig {
+        kind: "adaptive",
+        display: "summarized",
+    }
+}
+
+fn anthropic_thinking_unsupported(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("thinking")
+        && (body.contains("unsupported")
+            || body.contains("not supported")
+            || body.contains("unknown")
+            || body.contains("invalid")
+            || body.contains("unrecognized"))
+}
+
 fn responses_unsupported(status: u16, body: &str) -> bool {
     if status == 404 || status == 405 {
         return true;
@@ -462,6 +528,15 @@ struct AnthropicRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AnthropicThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    display: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -988,6 +1063,8 @@ struct AnthropicStreamDelta {
     thinking: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     partial_json: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1012,6 +1089,7 @@ struct AnthropicStreamState {
     content_emitted: usize,
     reasoning: String,
     reasoning_emitted: usize,
+    thinking_signature: Option<String>,
     usage: Option<Usage>,
     tool_calls: AnthropicToolAccumulator,
 }
@@ -1626,6 +1704,9 @@ where
                         if let (Some(index), Some(text)) = (event.index, delta.partial_json) {
                             state.tool_calls.append_arguments(index, text);
                         }
+                    }
+                    Some("signature_delta") => {
+                        state.thinking_signature = delta.signature;
                     }
                     _ => {}
                 }
@@ -2466,6 +2547,58 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_request_enables_adaptive_summarized_thinking_by_default() {
+        let mut provider = test_provider("anthropic", "https://api.anthropic.com/v1");
+        provider.default_model = "claude-sonnet-4-5".to_string();
+        let client = OpenAiCompatibleClient {
+            client: reqwest::Client::new(),
+            provider,
+            api_key: "test".to_string(),
+        };
+
+        let request =
+            client.anthropic_request(vec![ChatMessage::plain("user", "hi")], Vec::new(), true);
+        let json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn anthropic_request_can_disable_thinking_for_fallback() {
+        let mut provider = test_provider("anthropic", "https://api.anthropic.com/v1");
+        provider.default_model = "claude-sonnet-4-5".to_string();
+        let client = OpenAiCompatibleClient {
+            client: reqwest::Client::new(),
+            provider,
+            api_key: "test".to_string(),
+        };
+
+        let request =
+            client.anthropic_request(vec![ChatMessage::plain("user", "hi")], Vec::new(), false);
+        let json = serde_json::to_value(request).unwrap();
+
+        assert!(json.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_thinking_unsupported_detects_retryable_errors() {
+        assert!(anthropic_thinking_unsupported(
+            400,
+            "invalid request: thinking is not supported by this model"
+        ));
+        assert!(anthropic_thinking_unsupported(
+            422,
+            "unknown parameter: thinking"
+        ));
+        assert!(!anthropic_thinking_unsupported(401, "invalid api key"));
+        assert!(!anthropic_thinking_unsupported(
+            400,
+            "max_tokens is too low"
+        ));
+    }
+
+    #[test]
     fn anthropic_stream_emits_reasoning_content_and_usage() {
         let mut state = AnthropicStreamState::default();
         let mut chunks = Vec::new();
@@ -2496,6 +2629,22 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 3);
         assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn anthropic_stream_accepts_thinking_signature_delta() {
+        let mut state = AnthropicStreamState::default();
+        let mut on_chunk = |_| Ok(());
+
+        handle_anthropic_sse_data(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_123"}}"#,
+            &mut state,
+            &mut on_chunk,
+        )
+        .unwrap();
+
+        assert_eq!(state.thinking_signature.as_deref(), Some("sig_123"));
+        assert!(state.reasoning.is_empty());
     }
 
     #[test]
