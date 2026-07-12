@@ -100,6 +100,7 @@ impl Compactor {
 
         let last_seq = turns.last().unwrap().seq;
         self.state.hide_turns_before_seq(last_seq)?;
+        self.state.delete_hidden_turns()?;
         self.state.insert_summary_turn(
             &summary,
             Some(compact_usage.effective_total_tokens()),

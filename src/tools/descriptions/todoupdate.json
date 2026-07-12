@@ -61,5 +61,9 @@
     ]
   },
   "permission": "writes",
-  "always_loaded": false
+  "always_loaded": false,
+  "load_policy": "summary",
+  "groups": [
+    "planning"
+  ]
 }

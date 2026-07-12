@@ -19,5 +19,9 @@
     ]
   },
   "permission": "writes",
-  "always_loaded": true
+  "always_loaded": false,
+  "load_policy": "summary",
+  "groups": [
+    "memory"
+  ]
 }

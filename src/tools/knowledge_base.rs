@@ -392,20 +392,27 @@ impl KnowledgeBase {
             bail!("knowledge base file not found: {rel}")
         }
         let content = std::fs::read_to_string(&path)?;
-        let lines = content.lines().collect::<Vec<_>>();
-        let total = lines.len();
         let start = start_line.max(1);
+        let max_lines = max_lines
+            .unwrap_or(self.config.plugins.knowledge_base.max_read_lines)
+            .clamp(1, 5000);
+        let mut total = 0usize;
+        let mut selected = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let line_no = index + 1;
+            total = line_no;
+            if line_no >= start && selected.len() < max_lines {
+                selected.push(line);
+            }
+        }
         if start > total.max(1) {
             return Ok(format!(
                 "=== {rel} | start_line {start} out of range / {total} lines ==="
             ));
         }
-        let max_lines = max_lines
-            .unwrap_or(self.config.plugins.knowledge_base.max_read_lines)
-            .clamp(1, 5000);
         let end = (start + max_lines - 1).min(total);
         let mut output = format!("=== {rel} | lines {start}-{end} / {total} ===\n");
-        output.push_str(&lines[start - 1..end].join("\n"));
+        output.push_str(&selected.join("\n"));
         if end < total {
             output.push_str(&format!(
                 "\n\n... {remaining} more lines; continue with start_line={next}",
@@ -653,6 +660,7 @@ impl KnowledgeBase {
             if score > 0.0 {
                 let snippets = extract_snippets(
                     &content,
+                    &content_lower,
                     &tokens,
                     self.config.plugins.knowledge_base.snippet_context_chars,
                 );
@@ -1327,11 +1335,15 @@ fn best_window(
     best.filter(|(_, _, coverage)| *coverage > 0.0)
 }
 
-fn extract_snippets(content: &str, tokens: &[String], context: usize) -> Vec<String> {
-    let lower = content.to_ascii_lowercase();
+fn extract_snippets(
+    content: &str,
+    content_lower: &str,
+    tokens: &[String],
+    context: usize,
+) -> Vec<String> {
     let mut snippets = Vec::new();
     for token in tokens {
-        if let Some(pos) = lower.find(token) {
+        if let Some(pos) = content_lower.find(token) {
             snippets.push(snippet_chars(content, pos, pos + token.len(), context));
         }
         if snippets.len() >= 3 {

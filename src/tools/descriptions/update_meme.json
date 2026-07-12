@@ -44,5 +44,9 @@
     ]
   },
   "permission": "writes",
-  "always_loaded": false
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "memes"
+  ]
 }

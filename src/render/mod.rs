@@ -65,36 +65,62 @@ pub fn print_markdown(markdown: &str) {
     println!("{}", skin.term_text(markdown.trim_end()));
 }
 
-pub fn print_token_usage(turn_tokens: u64, session_tokens: u64, estimated: bool) -> Result<()> {
+pub fn print_token_usage(
+    turn_tokens: u64,
+    session_tokens: u64,
+    context_window: Option<usize>,
+    estimated: bool,
+) -> Result<()> {
     let prefix = if estimated {
         t("Estimated ", "估算")
     } else {
         ""
     };
-    let line = if crate::i18n::is_zh() {
-        format!(
-            "{prefix}本轮 Token 消耗：{}；会话总 Token 消耗：{}",
-            format_compact_count(turn_tokens),
-            format_compact_count(session_tokens)
-        )
-    } else {
-        format!(
-            "{prefix}Turn token cost: {}; session total token cost: {}",
-            format_compact_count(turn_tokens),
-            format_compact_count(session_tokens)
-        )
-    };
+    let line = format!(
+        "{prefix}Token: {}",
+        format_token_usage_inline(turn_tokens, session_tokens, context_window)
+    );
     let mut stdout = io::stdout();
     writeln!(stdout, "\x1b[2m{line}\x1b[0m\n")?;
     stdout.flush()?;
     Ok(())
 }
 
+pub(crate) fn format_token_usage_inline(
+    turn_tokens: u64,
+    session_tokens: u64,
+    context_window: Option<usize>,
+) -> String {
+    let context_window = context_window.map(|value| value as u64);
+    let context = context_window
+        .map(format_compact_count)
+        .unwrap_or_else(|| "?".to_string());
+    let usage_ratio = if let Some(context_window) = context_window.filter(|value| *value > 0) {
+        format!(
+            "{:.1}%",
+            session_tokens as f64 / context_window as f64 * 100.0
+        )
+    } else {
+        "?".to_string()
+    };
+
+    let session = format!(
+        "{}/{} ({usage_ratio})",
+        format_compact_count(session_tokens),
+        context,
+    );
+    if turn_tokens == 0 {
+        session
+    } else {
+        format!("{} · {session}", format_compact_count(turn_tokens))
+    }
+}
+
 pub fn usage_total(usage: &Usage) -> u64 {
     usage.effective_total_tokens()
 }
 
-fn format_compact_count(value: u64) -> String {
+pub(crate) fn format_compact_count(value: u64) -> String {
     const K: f64 = 1_000.0;
     const M: f64 = 1_000_000.0;
     if value >= 1_000_000 {
@@ -136,6 +162,7 @@ pub struct StreamRenderer {
     subagent_reasoning_chars: usize,
     subagent_reasoning_lines: usize,
     subagent_reasoning_line_open: bool,
+    sent_meme_filter: SentMemeStreamFilter,
 }
 
 impl StreamRenderer {
@@ -167,6 +194,7 @@ impl StreamRenderer {
             subagent_reasoning_chars: 0,
             subagent_reasoning_lines: 0,
             subagent_reasoning_line_open: false,
+            sent_meme_filter: SentMemeStreamFilter::default(),
         }
     }
 
@@ -179,7 +207,8 @@ impl StreamRenderer {
             t("thinking", "思考").to_string(),
             SpinnerStyle::Scanner,
         ));
-        self.last_tick = Some(std::time::Instant::now());
+        self.last_tick = None;
+        self.tick_spinner()?;
         Ok(())
     }
 
@@ -203,6 +232,14 @@ impl StreamRenderer {
             self.hide_cursor()?;
         }
         let text = normalize_stream_text(&chunk.text);
+        let text = if chunk.kind == ChatStreamKind::Content {
+            self.sent_meme_filter.push(&text)
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
         if self.plain && chunk.kind == ChatStreamKind::Reasoning {
             return Ok(());
         }
@@ -544,6 +581,10 @@ impl StreamRenderer {
         self.end_subagent_stream_line()?;
         if self.mode == Some(ChatStreamKind::Content) && !self.plain {
             let mut stdout = io::stdout();
+            let pending = self.sent_meme_filter.finish();
+            if !pending.is_empty() {
+                write!(stdout, "{}", self.markdown.push(&pending))?;
+            }
             write!(stdout, "{}", self.markdown.flush())?;
             stdout.flush()?;
         }
@@ -704,6 +745,7 @@ impl StreamRenderer {
                     style_summary_text(&self.tool_summary_text(), SummaryStyle::Tool)
                 );
             }
+            println!();
             self.tool_stats.clear();
             self.last_tool_summary.clear();
         }
@@ -887,7 +929,8 @@ impl StreamRenderer {
         }
         if self.wait_spinner.is_none() {
             self.wait_spinner = Some(WaitSpinner::start(phase, SpinnerStyle::Scanner));
-            self.last_tick = Some(std::time::Instant::now());
+            self.last_tick = None;
+            self.tick_spinner()?;
         } else {
             self.set_waiting_phase(phase);
         }
@@ -914,7 +957,8 @@ impl StreamRenderer {
         }
         if self.wait_spinner.is_none() {
             self.wait_spinner = Some(WaitSpinner::start(header, SpinnerStyle::Braille));
-            self.last_tick = Some(std::time::Instant::now());
+            self.last_tick = None;
+            self.tick_spinner()?;
         } else {
             self.set_waiting_phase(header);
         }
@@ -938,6 +982,63 @@ impl StreamRenderer {
         self.last_tick = None;
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct SentMemeStreamFilter {
+    pending: String,
+    inside_tag: bool,
+}
+
+impl SentMemeStreamFilter {
+    fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        let mut output = String::new();
+        loop {
+            if self.inside_tag {
+                if let Some(end) = self.pending.find("</sent_meme>") {
+                    let after = end + "</sent_meme>".len();
+                    self.pending.drain(..after);
+                    self.inside_tag = false;
+                    continue;
+                }
+                self.pending.clear();
+                return output;
+            }
+
+            let Some(start) = self.pending.find("<sent_meme>") else {
+                let keep = longest_sent_meme_prefix_suffix(&self.pending);
+                let emit_len = self.pending.len().saturating_sub(keep);
+                output.push_str(&self.pending[..emit_len]);
+                self.pending.drain(..emit_len);
+                return output;
+            };
+
+            output.push_str(&self.pending[..start]);
+            self.pending.drain(..start + "<sent_meme>".len());
+            self.inside_tag = true;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside_tag {
+            self.pending.clear();
+            self.inside_tag = false;
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn longest_sent_meme_prefix_suffix(text: &str) -> usize {
+    const TAG: &str = "<sent_meme>";
+    let max = TAG.len().saturating_sub(1).min(text.len());
+    for len in (1..=max).rev() {
+        if text.ends_with(&TAG[..len]) {
+            return len;
+        }
+    }
+    0
 }
 
 #[derive(Default)]
@@ -2242,6 +2343,18 @@ mod tests {
     fn list_markers_use_tertiary_color() {
         assert!(render_markdown_line("- item").contains(&format!("{TERTIARY_STYLE}-{RESET}")));
         assert!(render_markdown_line("1. item").contains(&format!("{TERTIARY_STYLE}1.{RESET}")));
+    }
+
+    #[test]
+    fn token_usage_hides_zero_turn_tokens() {
+        assert_eq!(
+            format_token_usage_inline(0, 1_300, Some(272_000)),
+            "1.3k/272k (0.5%)"
+        );
+        assert_eq!(
+            format_token_usage_inline(1_300, 1_300, Some(272_000)),
+            "1.3k · 1.3k/272k (0.5%)"
+        );
     }
 
     #[test]

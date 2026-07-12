@@ -12,6 +12,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::SystemTime;
 
 const BUILTIN_MEMES_DIR: &str = "/usr/share/miyu/memes";
+const MIN_SHORT_MEME_ID_LEN: usize = 7;
 
 static MEME_LIBRARY_CACHE: OnceLock<RwLock<Option<MemeLibraryCache>>> = OnceLock::new();
 
@@ -145,7 +146,7 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
             json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": t("Meme sha256 id.", "表情 sha256 id。") },
+                    "id": { "type": "string", "description": t("Full sha256 id or unique short id.", "完整 sha256 id 或唯一短 id。") },
                     "library": { "type": "string", "description": t("Optional meme library override.", "可选表情库覆盖。") },
                     "name_zh": { "type": "string" },
                     "name_en": { "type": "string" },
@@ -180,7 +181,7 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
             json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": t("Meme sha256 id.", "表情 sha256 id。") },
+                    "id": { "type": "string", "description": t("Full sha256 id or unique short id.", "完整 sha256 id 或唯一短 id。") },
                     "library": { "type": "string", "description": t("Optional meme library override.", "可选表情库覆盖。") },
                     "hard_delete": { "type": "boolean", "description": t("Permanently remove user image instead of moving it to trash.", "永久删除用户图片，而不是移入回收站。") }
                 },
@@ -221,7 +222,7 @@ fn register_search_and_show(registry: &mut ToolRegistry, config: AppConfig, path
                 "query": { "type": "string", "description": t("Scene, mood, visible content, or user intent.", "场景、情绪、画面内容或用户意图。") },
                 "tags": { "type": "array", "items": { "type": "string" }, "description": t("Optional preferred tags.", "可选偏好标签。") },
                 "library": { "type": "string", "description": t("Optional meme library override.", "可选表情库覆盖。") },
-                "limit": { "type": "integer", "description": t("Maximum number of candidates, default 6.", "候选数量上限，默认 6。") }
+                "limit": { "type": "integer", "description": t("Maximum number of candidates. Defaults to the meme plugin setting, max 3. Increase only when you need to compare alternatives.", "候选数量上限。默认使用表情包插件配置，最大 3。仅在需要比较多个备选时调大。") }
             },
             "additionalProperties": false
         }),
@@ -244,7 +245,7 @@ fn register_search_and_show(registry: &mut ToolRegistry, config: AppConfig, path
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": t("Meme sha256 id.", "表情 sha256 id。") },
+                "id": { "type": "string", "description": t("Full sha256 id or unique short id.", "完整 sha256 id 或唯一短 id。") },
                 "library": { "type": "string", "description": t("Optional meme library override.", "可选表情库覆盖。") },
                 "size": { "type": "string", "description": t("Optional chafa size, e.g. 40x15.", "可选 chafa 尺寸，例如 40x15。") },
                 "width": { "type": "integer", "description": t("Optional output width in terminal cells.", "可选终端单元格输出宽度。") },
@@ -275,9 +276,11 @@ async fn search_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Resu
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
-        .unwrap_or(6)
-        .clamp(1, 20) as usize;
-    let mut scored = load_library(paths, &library)?
+        .unwrap_or(config.plugins.memes.search_max_results as u64)
+        .clamp(1, 3) as usize;
+    let loaded = load_library(paths, &library)?;
+    let ids = meme_ids(&loaded);
+    let mut scored = loaded
         .into_iter()
         .filter_map(|meme| {
             let score = score_meme(&meme.item, query, &tags);
@@ -290,7 +293,7 @@ async fn search_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Resu
         .take(limit)
         .map(|(score, meme)| {
             json!({
-                "id": meme.item.id,
+                "id": unique_short_id_from_ids(&ids, &meme.item.id),
                 "name": meme.item.name,
                 "score": (score * 100.0).round() / 100.0,
                 "description": meme.item.description,
@@ -302,23 +305,29 @@ async fn search_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Resu
             })
         })
         .collect::<Vec<_>>();
+    if limit == 1 {
+        return Ok(json!({
+            "success": true,
+            "library": library,
+            "result": results.into_iter().next(),
+        })
+        .to_string());
+    }
     Ok(json!({ "success": true, "library": library, "results": results }).to_string())
 }
 
 async fn show_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
     let library = selected_library(&args, config);
     let id = required_str(&args, "id")?;
-    let meme = find_meme(paths, &library, id)?.with_context(|| format!("meme not found: {id}"))?;
+    let memes = load_library(paths, &library)?;
+    let ids = meme_ids(&memes);
+    let meme = find_meme_in(memes, id)?.with_context(|| format!("meme not found: {id}"))?;
     let size = meme_print_size(&args, &config.plugins.memes);
     vision::print_image_file(&meme.path, size).await?;
     Ok(json!({
         "success": true,
-        "library": library,
-        "id": meme.item.id,
-        "name": meme.item.name,
+        "id": unique_short_id_from_ids(&ids, &meme.item.id),
         "description": meme.item.description,
-        "animated": meme.item.animated,
-        "animation_note": if meme.item.animated && !config.plugins.memes.allow_gif_animation { Some("GIF was rendered as a normal chafa preview; animation is disabled by default.") } else { None },
     })
     .to_string())
 }
@@ -584,9 +593,28 @@ fn index_mtime(path: &Path) -> Option<SystemTime> {
 }
 
 fn find_meme(paths: &MiyuPaths, library: &str, id: &str) -> Result<Option<LoadedMeme>> {
-    Ok(load_library(paths, library)?
+    find_meme_in(load_library(paths, library)?, id)
+}
+
+fn find_meme_in(memes: Vec<LoadedMeme>, id: &str) -> Result<Option<LoadedMeme>> {
+    let requested = id_hash_part(id);
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    if !is_full_hash(requested) && requested.len() < MIN_SHORT_MEME_ID_LEN {
+        bail!(
+            "meme id prefix is too short: {requested}; use at least {MIN_SHORT_MEME_ID_LEN} hex characters"
+        );
+    }
+    let mut matches = memes
         .into_iter()
-        .find(|meme| ids_match(&meme.item.id, id)))
+        .filter(|meme| id_hash_part(&meme.item.id).starts_with(requested))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => bail!("meme id prefix is ambiguous: {requested}; use a longer id"),
+    }
 }
 
 fn ids_match(stored: &str, requested: &str) -> bool {
@@ -598,6 +626,32 @@ fn ids_match(stored: &str, requested: &str) -> bool {
 fn id_hash_part(value: &str) -> &str {
     let value = value.trim();
     value.strip_prefix("sha256:").unwrap_or(value)
+}
+
+fn is_full_hash(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn meme_ids(memes: &[LoadedMeme]) -> Vec<String> {
+    memes.iter().map(|meme| meme.item.id.clone()).collect()
+}
+
+fn unique_short_id_from_ids(ids: &[String], id: &str) -> String {
+    let hash = id_hash_part(id);
+    if hash.len() <= MIN_SHORT_MEME_ID_LEN {
+        return hash.to_string();
+    }
+    for len in MIN_SHORT_MEME_ID_LEN..=hash.len() {
+        let prefix = &hash[..len];
+        let matches = ids
+            .iter()
+            .filter(|candidate| id_hash_part(candidate).starts_with(prefix))
+            .count();
+        if matches <= 1 {
+            return prefix.to_string();
+        }
+    }
+    hash.to_string()
 }
 
 fn load_index(path: &Path) -> Result<Option<MemeIndex>> {
@@ -1049,5 +1103,82 @@ mod tests {
         assert!(ids_match(id, "abcdef1234567890"));
         assert!(ids_match(id, "abcdef12"));
         assert!(!ids_match(id, "123456"));
+    }
+
+    #[test]
+    fn unique_short_id_starts_at_git_style_length() {
+        let ids = vec!["sha256:abcdef1234567890".to_string()];
+
+        assert_eq!(
+            unique_short_id_from_ids(&ids, "sha256:abcdef1234567890"),
+            "abcdef1"
+        );
+    }
+
+    #[test]
+    fn unique_short_id_extends_until_unambiguous() {
+        let ids = vec![
+            "sha256:abcdef1234567890".to_string(),
+            "sha256:abcdef1999999999".to_string(),
+        ];
+
+        assert_eq!(
+            unique_short_id_from_ids(&ids, "sha256:abcdef1234567890"),
+            "abcdef12"
+        );
+    }
+
+    #[test]
+    fn find_meme_rejects_too_short_prefix() {
+        let err = find_meme_in(vec![test_loaded_meme("sha256:abcdef1234567890")], "abcdef")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("too short"));
+    }
+
+    #[test]
+    fn find_meme_rejects_ambiguous_prefix() {
+        let err = find_meme_in(
+            vec![
+                test_loaded_meme("sha256:abcdef1234567890"),
+                test_loaded_meme("sha256:abcdef1999999999"),
+            ],
+            "abcdef1",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ambiguous"));
+    }
+
+    #[test]
+    fn find_meme_accepts_unique_short_prefix() {
+        let meme = find_meme_in(vec![test_loaded_meme("sha256:abcdef1234567890")], "abcdef1")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(meme.item.id, "sha256:abcdef1234567890");
+    }
+
+    fn test_loaded_meme(id: &str) -> LoadedMeme {
+        LoadedMeme {
+            item: MemeItem {
+                id: id.to_string(),
+                name: LocalizedName {
+                    zh: "测试".to_string(),
+                    en: "test".to_string(),
+                },
+                file: "images/test.png".to_string(),
+                mime_type: "image/png".to_string(),
+                animated: false,
+                description: "测试表情".to_string(),
+                usage: "测试".to_string(),
+                avoid: String::new(),
+                tags: Vec::new(),
+            },
+            path: PathBuf::from("images/test.png"),
+            source: MemeSource::User,
+        }
     }
 }

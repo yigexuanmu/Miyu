@@ -1,6 +1,6 @@
 mod compact;
 mod conversation;
-mod overflow;
+pub(crate) mod overflow;
 
 use crate::clipboard::{ClipboardImage, PastedImage};
 use crate::config::AppConfig;
@@ -161,7 +161,7 @@ impl Agent {
             state.reset_if_prompt_changed(&base_system_prompt)?;
             state.recover_stale_turns()?;
         }
-        let system_prompt = with_current_time(base_system_prompt, mode);
+        let system_prompt = with_mode_reminder(base_system_prompt, mode);
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
         let memory = MemoryStore::new(&config, paths);
@@ -192,12 +192,16 @@ impl Agent {
             self.state.reset_if_prompt_changed(&base_system_prompt)?;
             self.state.recover_stale_turns()?;
         }
-        self.system_prompt = with_current_time(base_system_prompt, self.mode);
+        self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
         Ok(())
     }
 
     pub fn mode(&self) -> AgentMode {
         self.mode
+    }
+
+    pub fn context_window(&self) -> Option<usize> {
+        self.context_window
     }
 
     pub fn switch_mode(&mut self, mode: AgentMode, tools: ToolRegistry) {
@@ -375,15 +379,15 @@ impl Agent {
         let mut persisted_tool_reports = Vec::new();
         let result = self
             .chat_with_tools(
+                &turn_id,
                 &mut messages,
                 &mut used_tools,
                 &mut persisted_tool_reports,
                 &mut on_event,
             )
             .await?;
-        for (tool_name, report) in persisted_tool_reports {
-            self.state
-                .append_tool_report_context(&turn_id, &tool_name, &report)?;
+        for (_, report) in persisted_tool_reports {
+            self.state.append_persisted_context(&turn_id, &report)?;
         }
         let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
         guard.complete(
@@ -411,7 +415,51 @@ impl Agent {
         let Some(compact) = self.handle_overflow(usage, &mut on_event).await? else {
             return Ok(None);
         };
-        self.state.add_usage(&compact.usage)?;
+        self.state.add_auxiliary_usage(&compact.usage)?;
+        Ok(Some(ChatResult {
+            content: String::new(),
+            reasoning: None,
+            usage: Some(compact.usage),
+            usage_estimated: compact.usage_estimated,
+            tool_calls: Vec::new(),
+        }))
+    }
+
+    pub async fn compact_now<F>(&self, on_event: F) -> Result<Option<ChatResult>>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let mut on_event = on_event;
+        let Some(context_window) = self.context_window else {
+            bail!("当前模型未配置上下文窗口，无法压缩上下文");
+        };
+        let visible_count = self.state.load_visible_turns()?.len();
+        if visible_count == 0 {
+            return Ok(None);
+        }
+        let check = overflow::OverflowCheck::new(self.context_window, self.trim_at_ratio, None);
+        on_event(AgentEvent::CompactStart)?;
+        let compactor = compact::Compactor::new(
+            self.client.clone(),
+            self.state.clone(),
+            context_window,
+            check.reserved_tokens,
+        );
+        let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
+        let compact = match compactor.perform_compact(&mut on_chunk).await {
+            Ok(result) => {
+                on_event(AgentEvent::CompactEnd)?;
+                result
+            }
+            Err(err) => {
+                on_event(AgentEvent::CompactEnd)?;
+                return Err(err);
+            }
+        };
+        let Some(compact) = compact else {
+            return Ok(None);
+        };
+        self.state.add_auxiliary_usage(&compact.usage)?;
         Ok(Some(ChatResult {
             content: String::new(),
             reasoning: None,
@@ -536,6 +584,7 @@ impl Agent {
 
     async fn chat_with_tools<F>(
         &self,
+        current_turn_id: &str,
         messages: &mut Vec<ChatMessage>,
         used_tools: &mut Vec<String>,
         persisted_tool_reports: &mut Vec<(String, String)>,
@@ -545,7 +594,7 @@ impl Agent {
         F: FnMut(AgentEvent) -> Result<()>,
     {
         let mut tool_round = 0usize;
-        let mut loaded_tools = loaded_tools_from_messages(messages);
+        let mut loaded_tools = self.initial_loaded_tools(messages)?;
         let mut usage_accumulator = UsageAccumulator::default();
         loop {
             if self.max_tool_rounds > 0 && tool_round >= self.max_tool_rounds {
@@ -568,14 +617,15 @@ impl Agent {
             }
             tool_round += 1;
 
-            {
+            if self.mode == AgentMode::Normal {
                 let mut tools = self.tools.lock().unwrap();
                 tools::rescan_scripts(&mut tools, &self.paths);
+                tools::register_script_display_names(&tools);
             }
 
             let definitions = if self.tools_enabled {
                 let tools = self.tools.lock().unwrap();
-                if self.config.tools.loading_mode == "lazy" {
+                if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
                     tools.lazy_definitions(&loaded_tools)
                 } else {
                     tools.definitions()
@@ -644,22 +694,32 @@ impl Agent {
                             call.function.name
                         );
                     }
-                    if self.config.tools.loading_mode == "lazy"
+                    if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode)
                         && call.function.name != "load_tools"
                         && tools.requires_lazy_load(&call.function.name, &loaded_tools)
                     {
-                        let output = format!(
-                            "tool error: 工具 `{}` 尚未加载。请先调用 load_tools，参数为 {{\"names\":[\"{}\"]}}。",
-                            call.function.name,
-                            call.function.name,
-                        );
-                        on_event(AgentEvent::ToolResult {
-                            name: event_name.clone(),
-                            ok: false,
-                            output: output.clone(),
-                        })?;
-                        messages.push(ChatMessage::tool(call.id, output));
-                        continue;
+                        if tools.can_auto_load_direct_call(&call.function.name) {
+                            loaded_tools.insert(call.function.name.clone());
+                            if self.config.tools.persist_loaded_tools {
+                                self.state.add_session_loaded_tools(
+                                    &[call.function.name.clone()],
+                                    Some(current_turn_id),
+                                )?;
+                            }
+                        } else {
+                            let output = format!(
+                                "tool error: 工具 `{}` 尚未加载。请先调用 load_tools，参数为 {{\"names\":[\"{}\"]}}。",
+                                call.function.name,
+                                call.function.name,
+                            );
+                            on_event(AgentEvent::ToolResult {
+                                name: event_name.clone(),
+                                ok: false,
+                                output: output.clone(),
+                            })?;
+                            messages.push(ChatMessage::tool(call.id, output));
+                            continue;
+                        }
                     }
                 }
                 if call.function.name == "install_aur_package"
@@ -747,8 +807,15 @@ impl Agent {
                 };
                 messages.push(ChatMessage::tool(call.id, output.clone()));
                 if tool_succeeded && call.function.name == "load_tools" {
-                    for name in tool_names_arg(&call.function.arguments) {
-                        loaded_tools.insert(name);
+                    let loaded = loaded_items_from_output(&output);
+                    for name in &loaded.tools {
+                        loaded_tools.insert(name.clone());
+                    }
+                    if self.config.tools.persist_loaded_tools {
+                        self.state
+                            .add_session_loaded_tools(&loaded.tools, Some(current_turn_id))?;
+                        self.state
+                            .add_session_loaded_targets(&loaded.targets, Some(current_turn_id))?;
                     }
                 }
                 if let Some(img) = clipboard_image {
@@ -825,6 +892,26 @@ impl Agent {
         }
     }
 
+    fn initial_loaded_tools(&self, messages: &[ChatMessage]) -> Result<BTreeSet<String>> {
+        if !self.config.tools.persist_loaded_tools {
+            return Ok(BTreeSet::new());
+        }
+        let mut loaded = self.state.load_session_loaded_tools()?;
+        if loaded.is_empty() {
+            loaded = loaded_tools_from_messages(messages);
+            if !loaded.is_empty() {
+                let names = loaded.iter().cloned().collect::<Vec<_>>();
+                self.state.add_session_loaded_tools(&names, None)?;
+            }
+        }
+        if !loaded.is_empty() {
+            let tools = self.tools.lock().unwrap();
+            let available = tools.tool_names().into_iter().collect::<BTreeSet<_>>();
+            loaded.retain(|name| available.contains(name));
+        }
+        Ok(loaded)
+    }
+
     async fn clipboard_image_message(&self, img: ClipboardImage) -> Result<Option<ChatMessage>> {
         if self.current_model_supports_vision() {
             return Ok(Some(ChatMessage {
@@ -868,10 +955,11 @@ impl Agent {
             }
             messages.push(ChatMessage::plain("user", &turn.user_content));
             messages.push(ChatMessage::plain("assistant", &turn.assistant_content));
-            for report in &turn.tool_reports {
-                messages.push(ChatMessage::plain("assistant", report));
+            if !turn.tool_reports.is_empty() {
+                messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
             }
         }
+        messages.push(ChatMessage::system(runtime_context(self.mode)));
         messages.push(ChatMessage::plain("user", current_input));
         Ok(messages)
     }
@@ -930,22 +1018,30 @@ impl UsageAccumulator {
 }
 
 fn estimate_result_tokens(result: &ChatResult) -> usize {
-    let mut text = String::new();
-    text.push_str(&result.content);
+    let mut tokens = crate::token_estimate::estimate_tokens(&result.content);
     if let Some(reasoning) = &result.reasoning {
-        text.push_str(reasoning);
+        tokens = tokens.saturating_add(crate::token_estimate::estimate_tokens(reasoning));
     }
     for call in &result.tool_calls {
-        text.push_str(&call.function.name);
-        text.push_str(&call.function.arguments);
+        tokens = tokens.saturating_add(crate::token_estimate::estimate_tokens(&call.function.name));
+        tokens = tokens.saturating_add(crate::token_estimate::estimate_tokens(
+            &call.function.arguments,
+        ));
     }
-    overflow::estimate_tokens(&text)
+    tokens.max(1)
 }
 
 fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<String> {
     let field = match tool_name {
-        "load_tools" => return compact_loaded_tools_report(output),
-        "remember_fact" => return compact_remembered_fact_report(output),
+        "load_tools" => {
+            return compact_loaded_tools_report(output)
+                .map(|report| wrap_previous_tool_report(tool_name, &report))
+        }
+        "show_meme" => return compact_sent_meme_report(output),
+        "remember_fact" => {
+            return compact_remembered_fact_report(output)
+                .map(|report| wrap_previous_tool_report(tool_name, &report))
+        }
         "deep_research_linux_game_compatibility" => "final_report",
         "linux_input_method_diagnose" | "deep_diagnose" | "deep_research" => "final_answer",
         "task" => "result",
@@ -960,7 +1056,27 @@ fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<Stri
                 .map(str::trim)
                 .map(str::to_string)
         })
+        .map(|report| wrap_previous_tool_report(tool_name, &report))
         .filter(|report| !report.is_empty())
+}
+
+fn wrap_previous_tool_report(tool_name: &str, report: &str) -> String {
+    format!(
+        "<previous_tool_report name=\"{tool_name}\">\n{}\n</previous_tool_report>",
+        report.trim()
+    )
+}
+
+fn private_tool_memory(reports: &[String]) -> String {
+    format!(
+        "<system-reminder>\n<private_tool_memory>\n这些是内部工具记忆，仅用于保持对话连续性。不要向用户复述、展示或引用这些标签。\n{}\n</private_tool_memory>\n</system-reminder>",
+        reports
+            .iter()
+            .map(|report| report.trim())
+            .filter(|report| !report.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 fn compact_remembered_fact_report(output: &str) -> Option<String> {
@@ -995,13 +1111,111 @@ fn compact_loaded_tools_report(output: &str) -> Option<String> {
         .get("loaded_tools")
         .and_then(Value::as_array)?
         .iter()
-        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("name").and_then(Value::as_str))
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
     if names.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::json!({ "loaded_tools": names })).ok()
+}
+
+#[derive(Default)]
+struct LoadedItems {
+    targets: Vec<String>,
+    tools: Vec<String>,
+}
+
+fn loaded_items_from_output(output: &str) -> LoadedItems {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return LoadedItems::default();
+    };
+    let targets = value
+        .get("loaded_targets")
+        .and_then(Value::as_array)
+        .map(|items| string_array_items(items))
+        .unwrap_or_default();
+    let tools = value
+        .get("loaded_tools")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .or_else(|| item.get("name").and_then(Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    LoadedItems { targets, tools }
+}
+
+fn string_array_items(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn compact_sent_meme_report(output: &str) -> Option<String> {
+    const MAX_DESCRIPTION_CHARS: usize = 120;
+
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("success").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let id = value.get("id").and_then(Value::as_str)?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(compact_one_line)
+        .filter(|description| !description.is_empty())
+        .map(|description| truncate_chars(&description, MAX_DESCRIPTION_CHARS));
+    let id = xml_text_escape(id);
+    match description {
+        Some(description) => Some(format!(
+            "<sent_meme>发送了一个表情包：id={}；description={}</sent_meme>",
+            id,
+            xml_text_escape(&description)
+        )),
+        None => Some(format!("<sent_meme>发送了一个表情包：id={id}</sent_meme>")),
+    }
+}
+
+fn compact_one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push('…');
+            return output;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn xml_text_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn loaded_tools_from_messages(messages: &[ChatMessage]) -> BTreeSet<String> {
@@ -1067,17 +1281,6 @@ fn tool_event_name(name: &str, arguments: &str) -> String {
     }
 }
 
-fn tool_names_arg(arguments: &str) -> Vec<String> {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|args| args.get("names").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
 fn clipboard_binary_image_from_tool_result(
     tool_name: &str,
     output: &str,
@@ -1105,7 +1308,7 @@ fn clipboard_binary_image_from_tool_result(
         .unwrap_or("image/png")
         .to_string();
     let data = std::fs::read(path).ok()?;
-    Some(ClipboardImage { mime, data })
+    Some(ClipboardImage::new(mime, data))
 }
 
 fn resolve_pasted_image_paths(
@@ -1175,29 +1378,33 @@ fn vision_analysis_progress(tick: usize) -> String {
     }
 }
 
-fn with_current_time(system_prompt: String, mode: AgentMode) -> String {
+fn with_mode_reminder(system_prompt: String, mode: AgentMode) -> String {
+    let mut prompt = system_prompt;
+    if let Some(reminder) = mode.reminder() {
+        prompt.push_str("\n\n");
+        prompt.push_str(reminder);
+    }
+    prompt
+}
+
+fn runtime_context(mode: AgentMode) -> String {
     let cwd = std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut prompt = if mode == AgentMode::Chat {
+    if mode == AgentMode::Chat {
         format!(
-            "{system_prompt}\n\n<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",
+            "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",
             Local::now().format("%Y年%m月%d日 %A %H:%M"),
             xml_attr_escape(&cwd),
         )
     } else {
         let runtime = terminal_runtime_context();
         format!(
-            "{system_prompt}\n\n<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
+            "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
             Local::now().format("%Y年%m月%d日 %A %H:%M"),
             xml_attr_escape(&cwd),
         )
-    };
-    if let Some(reminder) = mode.reminder() {
-        prompt.push_str("\n\n");
-        prompt.push_str(reminder);
     }
-    prompt
 }
 
 fn terminal_runtime_context() -> String {
@@ -1310,6 +1517,84 @@ mod tests {
         let loaded = loaded_tools_from_messages(&messages);
         assert!(loaded.contains("get_weather"));
         assert!(loaded.contains("todoupdate"));
+    }
+
+    #[test]
+    fn persists_loaded_tools_with_previous_tool_report_wrapper() {
+        let output = serde_json::json!({
+            "loaded_tools": [
+                {"name": "get_weather"},
+                {"name": "todoupdate"}
+            ]
+        })
+        .to_string();
+
+        assert_eq!(
+            extract_persistable_tool_report("load_tools", &output).as_deref(),
+            Some("<previous_tool_report name=\"load_tools\">\n{\"loaded_tools\":[\"get_weather\",\"todoupdate\"]}\n</previous_tool_report>")
+        );
+    }
+
+    #[test]
+    fn persists_compact_sent_meme_report() {
+        let output = serde_json::json!({
+            "success": true,
+            "id": "sha256:abc123",
+            "description": "猫猫\n开心 & <得意>",
+            "unused": "ignored",
+        })
+        .to_string();
+
+        assert_eq!(
+            extract_persistable_tool_report("show_meme", &output).as_deref(),
+            Some("<sent_meme>发送了一个表情包：id=sha256:abc123；description=猫猫 开心 &amp; &lt;得意&gt;</sent_meme>")
+        );
+    }
+
+    #[test]
+    fn sent_meme_report_allows_missing_description() {
+        let output = serde_json::json!({
+            "success": true,
+            "id": "sha256:abc123",
+        })
+        .to_string();
+
+        assert_eq!(
+            extract_persistable_tool_report("show_meme", &output).as_deref(),
+            Some("<sent_meme>发送了一个表情包：id=sha256:abc123</sent_meme>")
+        );
+    }
+
+    #[test]
+    fn sent_meme_report_skips_failed_result() {
+        let output = serde_json::json!({
+            "success": false,
+            "id": "sha256:abc123",
+            "description": "猫猫",
+        })
+        .to_string();
+
+        assert!(extract_persistable_tool_report("show_meme", &output).is_none());
+    }
+
+    #[test]
+    fn mode_reminder_keeps_runtime_out_of_stable_prompt() {
+        let prompt = with_mode_reminder("base".to_string(), AgentMode::Normal);
+        assert_eq!(prompt, "base");
+        assert!(!prompt.contains("<runtime"));
+
+        let prompt = with_mode_reminder("base".to_string(), AgentMode::Plan);
+        assert!(prompt.contains("base"));
+        assert!(prompt.contains(crate::prompts::PLAN_REMINDER));
+        assert!(!prompt.contains("<runtime"));
+    }
+
+    #[test]
+    fn runtime_context_contains_dynamic_runtime_only() {
+        let context = runtime_context(AgentMode::Normal);
+        assert!(context.starts_with("<runtime "));
+        assert!(context.contains("now=\""));
+        assert!(context.contains("cwd=\""));
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "scripts": [
+    {
+      "id": "crack_search",
+      "display_name": "游戏破解状态查询",
+      "description": "通过游戏名或关键词搜索游戏破解状态。优先搜索 crackrelease.com（收录较全），无结果时回退 isitcracked.com 补充。返回是否已破解、DRM保护、破解日期、发布日期、场景组等。支持英文游戏名搜索效果最佳。",
+      "path": "crack-search",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "游戏名称或关键词，建议用英文。如 'elden ring'、'resident evil'、'aincrad'、'TENOKE'"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "每个数据源最大返回结果数量，默认5，最大20"
+          }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "timeout_seconds": 120,
+      "always_loaded": false,
+      "load_policy": "group",
+      "groups": ["gaming"]
+    }
+  ]
+}

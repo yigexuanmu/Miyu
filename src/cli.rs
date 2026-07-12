@@ -14,7 +14,7 @@ use crossterm::cursor::{self, Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
 };
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -27,10 +27,152 @@ use std::time::Duration;
 const REPL_MAX_VISIBLE_INPUT_ROWS: u16 = 12;
 const REPL_PASTE_PLACEHOLDER_MIN_LINES: usize = 3;
 const REPL_PASTE_PLACEHOLDER_MIN_CHARS: usize = 150;
-
 #[derive(Clone, Debug)]
 struct PastedText {
     text: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReplFooterStatus {
+    provider: String,
+    model: String,
+    thinking: Option<String>,
+    token_usage: ReplTokenUsage,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplTokenUsage {
+    turn_tokens: u64,
+    session_tokens: u64,
+    context_window: Option<usize>,
+}
+
+impl ReplFooterStatus {
+    fn from_config(config: &AppConfig, session_tokens: u64) -> Self {
+        let provider = config.provider(None).ok();
+        let provider_id = provider
+            .map(|provider| provider.id.trim().to_string())
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        let model = provider
+            .map(|provider| provider.default_model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+
+        Self {
+            model: short_model_name(&model, &provider_id),
+            provider: provider_id,
+            thinking: None,
+            token_usage: ReplTokenUsage {
+                turn_tokens: 0,
+                session_tokens,
+                context_window: config.active_context_window().ok().flatten(),
+            },
+        }
+    }
+
+    fn update_token_usage(
+        &mut self,
+        result: &crate::llm::ChatResult,
+        session_tokens: u64,
+        context_window: Option<usize>,
+    ) {
+        if let Some(usage) = &result.usage {
+            self.token_usage = ReplTokenUsage {
+                turn_tokens: render::usage_total(usage),
+                session_tokens,
+                context_window: context_window.or(self.token_usage.context_window),
+            };
+        }
+    }
+
+    fn update_session_tokens(&mut self, session_tokens: u64) {
+        self.token_usage.session_tokens = session_tokens;
+    }
+}
+
+fn short_model_name(model: &str, provider: &str) -> String {
+    model
+        .strip_prefix(&format!("{provider}/"))
+        .unwrap_or(model)
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_string()
+}
+
+fn repl_footer_line(mode: AgentMode, footer: &ReplFooterStatus, cols: usize) -> String {
+    let cols = cols.max(1);
+    let bar = input_prompt_bar(mode);
+    let bar_width = visible_width(&bar);
+    let usage = footer.token_usage;
+    let right_plain = render::format_token_usage_inline(
+        usage.turn_tokens,
+        usage.session_tokens,
+        usage.context_window,
+    );
+    let right = format!("\x1b[2m{right_plain}\x1b[0m");
+    let right_width = visible_width(&right);
+    let left_budget = cols.saturating_sub(bar_width.saturating_add(right_width).saturating_add(1));
+    let left = repl_footer_left(mode, footer, left_budget);
+    let gap = cols
+        .saturating_sub(
+            bar_width
+                .saturating_add(visible_width(&left))
+                .saturating_add(right_width),
+        )
+        .max(1);
+    format!("{bar}{left}{}{right}", " ".repeat(gap))
+}
+
+fn repl_footer_left(mode: AgentMode, footer: &ReplFooterStatus, width: usize) -> String {
+    let thinking = footer.thinking.as_deref().unwrap_or_default();
+    let provider = format!("\x1b[2m{}\x1b[0m", footer.provider);
+    let mode = colored_footer_mode_label(mode);
+    let full = repl_footer_left_parts(&mode, &footer.model, Some(&provider), thinking);
+    if visible_width(&full) <= width {
+        return full;
+    }
+
+    let compact = repl_footer_left_parts(&mode, &footer.model, None, thinking);
+    if visible_width(&compact) <= width {
+        return compact;
+    }
+
+    let fixed_width = visible_width(&mode)
+        .saturating_add(if thinking.is_empty() {
+            0
+        } else {
+            1 + thinking.len()
+        })
+        .saturating_add(1);
+    let model_budget = width.saturating_sub(fixed_width).max(1);
+    let model = truncate_display(&footer.model, model_budget);
+    repl_footer_left_parts(&mode, &model, None, thinking)
+}
+
+fn repl_footer_left_parts(
+    mode: &str,
+    model: &str,
+    provider: Option<&str>,
+    thinking: &str,
+) -> String {
+    let mut parts = vec![mode.to_string(), model.to_string()];
+    if let Some(provider) = provider.filter(|provider| !provider.is_empty()) {
+        parts.push(provider.to_string());
+    }
+    if !thinking.is_empty() {
+        parts.push(thinking.to_string());
+    }
+    parts.join(" ")
+}
+
+fn colored_footer_mode_label(mode: AgentMode) -> String {
+    match mode {
+        AgentMode::Normal => "\x1b[1m\x1b[34mNormal\x1b[0m".to_string(),
+        AgentMode::Plan => "\x1b[1m\x1b[35mPlan\x1b[0m".to_string(),
+        AgentMode::Chat => "\x1b[1m\x1b[32mChat\x1b[0m".to_string(),
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -46,7 +188,13 @@ pub struct Cli {
     pub shell_intercept: bool,
 
     #[arg(long, hide = true)]
+    pub shell_classify: bool,
+
+    #[arg(long, hide = true)]
     pub shell: Option<String>,
+
+    #[arg(long, hide = true)]
+    pub stdin: bool,
 
     #[arg(long, hide = true)]
     pub clipboard_paste: bool,
@@ -619,6 +767,12 @@ pub enum ConfigCommand {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if cli.shell_classify {
+        let shell_name = cli.shell.as_deref().unwrap_or("fish");
+        let message = shell_message_from_input(cli.stdin, cli.message)?;
+        return run_shell_classify(shell_name, &message);
+    }
+
     let paths = MiyuPaths::new()?;
     let mode = if cli.plan {
         AgentMode::Plan
@@ -631,7 +785,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     if cli.shell_intercept {
         let shell_name = cli.shell.as_deref().unwrap_or("fish");
-        let message = join_message(cli.message);
+        let message = shell_message_from_input(cli.stdin, cli.message)?;
         return run_shell_intercept(&paths, shell_name, message).await;
     }
 
@@ -1001,11 +1155,20 @@ fn run_providers(paths: &MiyuPaths, args: ProvidersArgs) -> Result<()> {
         return Ok(());
     }
     if io::stdout().is_terminal() && io::stdin().is_terminal() {
+        let active_index = choices.iter().position(|choice| {
+            config
+                .provider(None)
+                .map(|provider| {
+                    provider.id == choice.provider_id && provider.default_model == choice.model
+                })
+                .unwrap_or(false)
+        });
         if let Some(index) = inline_fuzzy_select(
             &choices
                 .iter()
                 .map(|choice| choice.label())
                 .collect::<Vec<_>>(),
+            active_index,
         )? {
             let choice = &choices[index];
             let provider_id = choice.provider_id.clone();
@@ -1034,7 +1197,7 @@ fn run_providers(paths: &MiyuPaths, args: ProvidersArgs) -> Result<()> {
     Ok(())
 }
 
-fn inline_fuzzy_select(items: &[String]) -> Result<Option<usize>> {
+fn inline_fuzzy_select(items: &[String], active_index: Option<usize>) -> Result<Option<usize>> {
     let menu_lines = inline_fuzzy_lines(items.len());
     reserve_inline_fuzzy_space(menu_lines)?;
     let mut session = InlineRawMode::start()?;
@@ -1056,6 +1219,7 @@ fn inline_fuzzy_select(items: &[String]) -> Result<Option<usize>> {
             items,
             &matches,
             selected,
+            active_index,
         )?;
         if let Event::Key(KeyEvent {
             code, modifiers, ..
@@ -1125,9 +1289,11 @@ fn draw_inline_fuzzy(
     items: &[String],
     matches: &[(i64, usize)],
     selected: usize,
+    active_index: Option<usize>,
 ) -> Result<()> {
     let (cols, _) = terminal::size().unwrap_or((80, 24));
-    let width = cols.saturating_sub(2).max(24) as usize;
+    let bar = inline_fuzzy_bar();
+    let width = (cols as usize).saturating_sub(visible_width(&bar)).max(1);
     let visible = matches.len().min(menu_lines.saturating_sub(2) as usize);
     queue!(stdout, Hide)?;
     for row in 0..menu_lines {
@@ -1140,44 +1306,80 @@ fn draw_inline_fuzzy(
     queue!(
         stdout,
         MoveTo(0, anchor_y),
-        Print(truncate_display(&format!("> {query}"), width)),
+        Print(&bar),
+        Print(inline_fuzzy_header(query, width)),
     )?;
     if matches.is_empty() {
         queue!(
             stdout,
             MoveTo(0, anchor_y + 1),
-            Print(t("  no matches", "  没有匹配项"))
+            Print(&bar),
+            Print(format!("\x1b[2m{}\x1b[0m", t("no matches", "没有匹配项")))
         )?;
     } else {
         for (row, (_, item_index)) in matches.iter().take(visible).enumerate() {
-            let marker = if row == selected { ">" } else { " " };
-            let line = truncate_display(&format!("{marker} {}", items[*item_index]), width);
-            queue!(stdout, MoveTo(0, anchor_y + row as u16 + 1))?;
-            if row == selected {
-                queue!(
-                    stdout,
-                    SetAttribute(Attribute::Reverse),
-                    Print(line),
-                    SetAttribute(Attribute::Reset)
-                )?;
-            } else {
-                queue!(stdout, Print(line))?;
-            }
+            queue!(
+                stdout,
+                MoveTo(0, anchor_y + row as u16 + 1),
+                Print(&bar),
+                Print(inline_fuzzy_item_line(
+                    items[*item_index].as_str(),
+                    row == selected,
+                    Some(*item_index) == active_index,
+                    width
+                ))
+            )?;
         }
     }
     queue!(
         stdout,
         MoveTo(0, anchor_y + menu_lines.saturating_sub(1)),
-        Print(truncate_display(
-            t(
-                "[type] search  [j/k] move  [enter] select  [esc/q] cancel",
-                "[输入] 搜索  [j/k] 移动  [enter] 选择  [esc/q] 取消",
-            ),
-            width
-        ))
+        Print(&bar),
+        Print(inline_fuzzy_help_line(width))
     )?;
     stdout.flush()?;
     Ok(())
+}
+
+fn inline_fuzzy_bar() -> String {
+    input_prompt_bar(AgentMode::Normal)
+}
+
+fn inline_fuzzy_header(query: &str, width: usize) -> String {
+    let title = t("Select model", "选择模型");
+    let line = if query.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} · {}", query.trim())
+    };
+    format!("\x1b[1m{}\x1b[0m", truncate_visible_width(&line, width))
+}
+
+fn inline_fuzzy_item_line(item: &str, selected: bool, active: bool, width: usize) -> String {
+    let line = if selected {
+        format!("› {item}")
+    } else {
+        format!("  {item}")
+    };
+    let line = truncate_visible_width(&line, width);
+    if selected {
+        format!(
+            "\x1b[1m\x1b[35m›\x1b[0m\x1b[1m{}\x1b[0m",
+            line.strip_prefix('›').unwrap_or(&line)
+        )
+    } else if active {
+        format!("\x1b[1m\x1b[32m{}\x1b[0m", line)
+    } else {
+        format!("\x1b[2m{}\x1b[0m", line)
+    }
+}
+
+fn inline_fuzzy_help_line(width: usize) -> String {
+    let line = t(
+        "type search · j/k move · Enter select · Esc cancel",
+        "输入搜索 · j/k 移动 · Enter 选择 · Esc 取消",
+    );
+    format!("\x1b[2m{}\x1b[0m", truncate_visible_width(line, width))
 }
 
 fn clear_inline_fuzzy(stdout: &mut io::Stdout, anchor_y: u16, lines: u16) -> Result<()> {
@@ -1344,23 +1546,69 @@ fn run_clipboard_paste(paths: &MiyuPaths) -> Result<()> {
             io::stdout().flush()?;
             Ok(())
         }
+        Ok(crate::clipboard::ClipboardContent::Text(text)) => {
+            if should_summarize_pasted_text(&text) {
+                let index = shell_pasted_text_index(&paths.cache_dir, &text)?;
+                let placeholder = pasted_text_placeholder(index, pasted_text_line_count(&text));
+                print!("{}", placeholder);
+            } else {
+                print!("{}", text);
+            }
+            io::stdout().flush()?;
+            Ok(())
+        }
         _ => {
             std::process::exit(1);
         }
     }
 }
 
+fn shell_pasted_text_index(cache_dir: &std::path::Path, text: &str) -> Result<usize> {
+    let dir = cache_dir.join("clipboard_texts");
+    std::fs::create_dir_all(&dir)?;
+    let mut index = 1;
+    loop {
+        let path = dir.join(format!("{index}.txt"));
+        if !path.exists() {
+            std::fs::write(path, text)?;
+            return Ok(index);
+        }
+        index += 1;
+    }
+}
+
+fn shell_message_from_input(use_stdin: bool, message: Vec<String>) -> Result<String> {
+    if use_stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        Ok(input)
+    } else {
+        Ok(join_message(message))
+    }
+}
+
+fn run_shell_classify(shell_name: &str, message: &str) -> Result<()> {
+    if !matches!(shell_name, "fish" | "bash" | "zsh") {
+        std::process::exit(2);
+    }
+    if shell::is_shell_command(message, shell_name) {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
 async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: String) -> Result<()> {
     if !matches!(shell_name, "fish" | "bash" | "zsh") {
         bail!("{}: {shell_name}", t("unsupported shell", "不支持的 shell"));
     }
-    if message.is_empty() || !shell::looks_like_natural_language(&message) {
+    if message.trim().is_empty() {
         bail!(
             "{}",
             t("not a natural language command", "不是自然语言命令")
         );
     }
 
+    let message = expand_shell_pasted_text_placeholders(paths, &message)?;
     let (clean_message, pasted_images) = extract_image_placeholders(&message);
 
     let result = if pasted_images.is_empty() {
@@ -1373,6 +1621,29 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
         println!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
     }
     result
+}
+
+fn expand_shell_pasted_text_placeholders(paths: &MiyuPaths, message: &str) -> Result<String> {
+    let placeholders = find_pasted_text_placeholders(message);
+    if placeholders.is_empty() {
+        return Ok(message.to_string());
+    }
+
+    let chars: Vec<char> = message.chars().collect();
+    let mut expanded = String::new();
+    let mut last_end = 0;
+    let dir = paths.cache_dir.join("clipboard_texts");
+    for (start, end, index) in placeholders {
+        expanded.extend(&chars[last_end..start]);
+        let path = dir.join(format!("{index}.txt"));
+        match std::fs::read_to_string(&path) {
+            Ok(text) => expanded.push_str(&text),
+            Err(_) => expanded.extend(&chars[start..end]),
+        }
+        last_end = end;
+    }
+    expanded.extend(&chars[last_end..]);
+    Ok(expanded)
 }
 
 fn extract_image_placeholders(
@@ -1460,7 +1731,12 @@ async fn run_chat_with_images(
         .await;
     renderer.finish()?;
     let result = result?;
-    print_chat_token_usage(&result, show_token_usage, state.token_total()?)?;
+    print_chat_token_usage(
+        &result,
+        show_token_usage,
+        state.token_total()?,
+        agent.context_window(),
+    )?;
     handle_post_turn_overflow(&agent, &mut renderer, &result, show_token_usage, &state).await?;
     Ok(())
 }
@@ -1564,7 +1840,12 @@ async fn run_chat_with_options(
         .await;
     renderer.finish()?;
     let result = result?;
-    print_chat_token_usage(&result, show_token_usage, state.token_total()?)?;
+    print_chat_token_usage(
+        &result,
+        show_token_usage,
+        state.token_total()?,
+        agent.context_window(),
+    )?;
     handle_post_turn_overflow(&agent, &mut renderer, &result, show_token_usage, &state).await?;
     Ok(())
 }
@@ -1573,11 +1854,17 @@ fn print_chat_token_usage(
     result: &crate::llm::ChatResult,
     enabled: bool,
     session_token_total: u64,
+    context_window: Option<usize>,
 ) -> Result<()> {
     if enabled {
         if let Some(usage) = &result.usage {
             let turn_tokens = render::usage_total(usage);
-            render::print_token_usage(turn_tokens, session_token_total, result.usage_estimated)?;
+            render::print_token_usage(
+                turn_tokens,
+                session_token_total,
+                context_window,
+                result.usage_estimated,
+            )?;
         }
     }
     Ok(())
@@ -1598,7 +1885,12 @@ async fn handle_post_turn_overflow(
         .await?;
     renderer.finish()?;
     if let Some(compact_result) = compact_result {
-        print_chat_token_usage(&compact_result, show_token_usage, state.token_total()?)?;
+        print_chat_token_usage(
+            &compact_result,
+            show_token_usage,
+            state.token_total()?,
+            agent.context_window(),
+        )?;
     }
     Ok(())
 }
@@ -1614,17 +1906,12 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     let mut input_history = load_repl_input_history(&state)?;
     let mut prefill = None::<String>;
 
-    println!(
-        "\x1b[2m{}\x1b[0m",
-        t(
-            "Tab cycles NORMAL/PLAN/CHAT; Enter sends; Ctrl+J inserts newline; Ctrl+V pastes clipboard",
-            "Tab 循环切换 普通/计划/闲聊；Enter 发送；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
-        )
-    );
     crate::default_kb::check_update_if_due(paths).ok();
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
         println!("\x1b[2m{message}\x1b[0m");
     }
+    let mut footer = ReplFooterStatus::from_config(&config, state.token_total()?);
+    let mut show_shortcut_hint = true;
     let initial_registry = build_tool_registry(&config, paths, mode)?;
     let mut agent = Agent::new(
         config.clone(),
@@ -1635,73 +1922,118 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         mode,
     )?;
     loop {
-        let (input, pasted_images) =
-            match read_repl_input(paths, mode, prefill.take(), &input_history)? {
-                Some((new_mode, input, pasted_images)) => {
-                    mode = new_mode;
-                    (input, pasted_images)
-                }
-                None => break,
-            };
+        let (input, pasted_images) = match read_repl_input(
+            paths,
+            mode,
+            prefill.take(),
+            &input_history,
+            &footer,
+            show_shortcut_hint,
+        )? {
+            Some((new_mode, input, pasted_images)) => {
+                mode = new_mode;
+                (input, pasted_images)
+            }
+            None => break,
+        };
         let input = input.trim();
+        let command = resolve_repl_command(input);
         if input.eq_ignore_ascii_case("exit")
             || input.eq_ignore_ascii_case("quit")
-            || input.eq_ignore_ascii_case("/exit")
+            || command.eq_ignore_ascii_case("/exit")
         {
             break;
         }
-        if input.eq_ignore_ascii_case("/help") {
+        if command.eq_ignore_ascii_case("/help") {
             print_repl_help();
             continue;
         }
-        if input.eq_ignore_ascii_case("/plan") {
-            mode = AgentMode::Plan;
-            println!("{}: {}", t("mode", "模式"), mode.label());
-            continue;
-        }
-        if input.eq_ignore_ascii_case("/chat") {
-            mode = AgentMode::Chat;
-            println!("{}: {}", t("mode", "模式"), mode.label());
-            continue;
-        }
-        if input.eq_ignore_ascii_case("/normal") {
-            mode = AgentMode::Normal;
-            println!("{}: {}", t("mode", "模式"), mode.label());
-            continue;
-        }
-        if input.eq_ignore_ascii_case("/providers") {
+        if command.eq_ignore_ascii_case("/models") {
             run_providers(paths, ProvidersArgs { index: None })?;
             reload_repl_config(paths, &mut config, &mut client)?;
+            footer = ReplFooterStatus::from_config(&config, state.token_total()?);
             let registry = build_tool_registry(&config, paths, mode)?;
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
             println!("{}", t("configuration reloaded", "配置已重新加载"));
+            println!();
             continue;
         }
-        if input.eq_ignore_ascii_case("/config") {
+        if command.eq_ignore_ascii_case("/config") {
             crate::config_tui::run(paths)?;
             reload_repl_config(paths, &mut config, &mut client)?;
+            footer = ReplFooterStatus::from_config(&config, state.token_total()?);
             let registry = build_tool_registry(&config, paths, mode)?;
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
             println!("{}", t("configuration reloaded", "配置已重新加载"));
+            println!();
             continue;
         }
-        if input.eq_ignore_ascii_case("/undo") {
+        if command.eq_ignore_ascii_case("/undo") {
             let (removed, prompt) = state.undo_last_turn()?;
+            footer.update_session_tokens(state.token_total()?);
             println!("{}: {removed}", t("undone messages", "已撤销消息数"));
             prefill = prompt;
             continue;
         }
-        if input.eq_ignore_ascii_case("/reset") {
-            run_reset(paths, None)?;
-            input_history.clear();
+        if command.eq_ignore_ascii_case("/compact") {
+            let reasoning_mode =
+                render::ReasoningDisplayMode::from_config(&config.display.reasoning);
+            let tool_call_mode =
+                render::ToolCallDisplayMode::from_config(&config.display.tool_calls);
+            let mut renderer = render::StreamRenderer::new(
+                reasoning_mode,
+                tool_call_mode,
+                false,
+                config.display.readable_tool_names,
+            );
+            match agent
+                .compact_now(|event| handle_agent_event(&mut renderer, event))
+                .await
+            {
+                Ok(Some(result)) => {
+                    renderer.finish()?;
+                    footer.update_token_usage(
+                        &result,
+                        state.token_total()?,
+                        agent.context_window(),
+                    );
+                    if config.display.show_token_usage {
+                        print_chat_token_usage(
+                            &result,
+                            true,
+                            state.token_total()?,
+                            agent.context_window(),
+                        )?;
+                    }
+                }
+                Ok(None) => {
+                    renderer.finish()?;
+                    println!(
+                        "\x1b[2m{}\x1b[0m",
+                        t("nothing to compact", "没有可压缩的上下文")
+                    );
+                    footer.update_session_tokens(state.token_total()?);
+                }
+                Err(err) => {
+                    renderer.finish()?;
+                    eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
+                }
+            }
             continue;
         }
-        if input.eq_ignore_ascii_case("/reset all") {
+        if command.eq_ignore_ascii_case("/reset") {
+            run_reset(paths, None)?;
+            input_history.clear();
+            footer.update_session_tokens(state.token_total()?);
+            continue;
+        }
+        if command.eq_ignore_ascii_case("/reset all") {
             run_reset(paths, Some("all"))?;
             input_history.clear();
             agent.reset_memory()?;
+            footer.update_session_tokens(state.token_total()?);
             continue;
         }
         if input.is_empty() {
@@ -1723,26 +2055,31 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         );
         renderer.start_waiting()?;
         let chat_result = {
+            let renderer_cell = std::cell::RefCell::new(&mut renderer);
             let chat = agent.chat_stream_with_images(input, &pasted_images, |event| {
-                handle_agent_event(&mut renderer, event)
+                handle_agent_event(&mut *renderer_cell.borrow_mut(), event)
             });
             tokio::pin!(chat);
-            tokio::select! {
-                result = &mut chat => result.map(Some),
-                signal = tokio::signal::ctrl_c() => {
-                    signal?;
-                    Ok(None)
+            let mut spinner_tick = tokio::time::interval(render::wait_spinner::SPINNER_INTERVAL);
+            spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            spinner_tick.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut chat => break result.map(Some),
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        break Ok(None);
+                    }
+                    _ = spinner_tick.tick() => {
+                        renderer_cell.borrow_mut().tick_spinner()?;
+                    }
                 }
             }
         };
         renderer.finish()?;
         match chat_result {
             Ok(Some(result)) => {
-                print_chat_token_usage(
-                    &result,
-                    config.display.show_token_usage,
-                    state.token_total()?,
-                )?;
+                footer.update_token_usage(&result, state.token_total()?, agent.context_window());
                 if let Err(err) = handle_post_turn_overflow(
                     &agent,
                     &mut renderer,
@@ -1755,6 +2092,7 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
                     eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
                     continue;
                 }
+                show_shortcut_hint = false;
             }
             Ok(None) => {}
             Err(err) => {
@@ -1789,33 +2127,25 @@ fn load_repl_input_history(state: &StateStore) -> Result<Vec<String>> {
 fn print_repl_help() {
     println!("{}", t("commands:", "命令:"));
     println!(
-        "  /providers  {}",
-        t("switch provider or model", "切换 provider 或模型")
+        "  /models     {}",
+        t("quickly switch model", "快速切换模型")
     );
     println!(
         "  /config     {}",
         t("open configuration UI", "打开配置界面")
     );
     println!(
-        "  /plan       {}",
-        t("switch to read-only planning mode", "切换到只读计划模式")
-    );
-    println!(
-        "  /normal     {}",
-        t("switch to normal mode", "切换到普通模式")
-    );
-    println!(
-        "  /chat       {}",
-        t(
-            "switch to lightweight chat mode with web and memes only",
-            "切换到仅开放网络和表情的轻量闲聊模式"
-        )
-    );
-    println!(
         "  /undo       {}",
         t(
             "remove last turn and restore prompt",
             "撤销上一轮并恢复输入"
+        )
+    );
+    println!(
+        "  /compact   {}",
+        t(
+            "compact current conversation context now",
+            "立即压缩当前会话上下文"
         )
     );
     println!(
@@ -1860,6 +2190,8 @@ fn read_repl_input(
     mut mode: AgentMode,
     prefill: Option<String>,
     history: &[String],
+    footer: &ReplFooterStatus,
+    show_shortcut_hint: bool,
 ) -> Result<
     Option<(
         AgentMode,
@@ -1871,6 +2203,8 @@ fn read_repl_input(
     let mut input = strip_terminal_control_sequences(&prefill.unwrap_or_default());
     let mut cursor = input.chars().count();
     let mut history_index = history.len();
+    let mut history_clean_index: Option<usize> = None;
+    let plain_prefix = "  ";
     let (cursor_col, _) = cursor::position()?;
     if cursor_col != 0 {
         writeln!(stdout)?;
@@ -1883,6 +2217,25 @@ fn read_repl_input(
     let mut is_pasted = false;
     let mut pasted_images: Vec<Option<crate::clipboard::PastedImage>> = Vec::new();
     let mut pasted_texts: Vec<Option<PastedText>> = Vec::new();
+    let render_repl_input = |stdout: &mut io::Stdout,
+                             input_row: &mut u16,
+                             rendered_rows: &mut u16,
+                             mode: AgentMode,
+                             input: &str,
+                             cursor: usize,
+                             is_pasted: bool| {
+        render_repl_input_with_footer(
+            stdout,
+            input_row,
+            rendered_rows,
+            mode,
+            input,
+            cursor,
+            is_pasted,
+            footer,
+            show_shortcut_hint,
+        )
+    };
     render_repl_input(
         &mut stdout,
         &mut input_row,
@@ -1896,6 +2249,7 @@ fn read_repl_input(
         match event::read()? {
             Event::Paste(text) => {
                 insert_pasted_text_at_cursor(&mut input, &mut cursor, text, &mut pasted_texts);
+                history_clean_index = None;
                 is_pasted = true;
                 render_repl_input(
                     &mut stdout,
@@ -1915,6 +2269,7 @@ fn read_repl_input(
                         if let Some(completed) = complete_repl_command(&input) {
                             input = completed.to_string();
                             cursor = input.chars().count();
+                            history_clean_index = None;
                         }
                     } else {
                         mode = match mode {
@@ -1937,6 +2292,7 @@ fn read_repl_input(
                 KeyCode::Esc => {
                     input.clear();
                     cursor = 0;
+                    history_clean_index = None;
                     is_pasted = false;
                     pasted_images.clear();
                     pasted_texts.clear();
@@ -2007,36 +2363,51 @@ fn read_repl_input(
                     )?;
                 }
                 KeyCode::Up => {
-                    if !history.is_empty() {
+                    if !history.is_empty()
+                        && repl_should_browse_history(&input, history, history_clean_index)
+                    {
+                        if input.is_empty() {
+                            history_index = history.len();
+                        }
                         history_index = history_index.saturating_sub(1);
                         input = history.get(history_index).cloned().unwrap_or_default();
                         cursor = input.chars().count();
+                        history_clean_index = Some(history_index);
                         is_pasted = false;
                         pasted_images.clear();
                         pasted_texts.clear();
-                        render_repl_input(
-                            &mut stdout,
-                            &mut input_row,
-                            &mut rendered_rows,
-                            mode,
-                            &input,
-                            cursor,
-                            is_pasted,
-                        )?;
+                    } else {
+                        cursor = repl_move_cursor_vertical(&plain_prefix, &input, cursor, -1);
                     }
+                    render_repl_input(
+                        &mut stdout,
+                        &mut input_row,
+                        &mut rendered_rows,
+                        mode,
+                        &input,
+                        cursor,
+                        is_pasted,
+                    )?;
                 }
                 KeyCode::Down => {
-                    if history_index + 1 < history.len() {
-                        history_index += 1;
-                        input = history.get(history_index).cloned().unwrap_or_default();
+                    if repl_history_is_clean(&input, history, history_clean_index) {
+                        if history_index + 1 < history.len() {
+                            history_index += 1;
+                            input = history.get(history_index).cloned().unwrap_or_default();
+                            cursor = input.chars().count();
+                            history_clean_index = Some(history_index);
+                        } else {
+                            history_index = history.len();
+                            input.clear();
+                            cursor = 0;
+                            history_clean_index = None;
+                        }
+                        is_pasted = false;
+                        pasted_images.clear();
+                        pasted_texts.clear();
                     } else {
-                        history_index = history.len();
-                        input.clear();
+                        cursor = repl_move_cursor_vertical(&plain_prefix, &input, cursor, 1);
                     }
-                    cursor = input.chars().count();
-                    is_pasted = false;
-                    pasted_images.clear();
-                    pasted_texts.clear();
                     render_repl_input(
                         &mut stdout,
                         &mut input_row,
@@ -2048,15 +2419,22 @@ fn read_repl_input(
                     )?;
                 }
                 KeyCode::Enter => {
-                    input = strip_terminal_control_sequences(&input);
-                    input = expand_pasted_text_placeholders(&input, &pasted_texts);
-                    move_after_repl_input(&mut stdout, input_row, rendered_rows)?;
+                    let submitted_echo = strip_terminal_control_sequences(&input);
+                    input = expand_pasted_text_placeholders(&submitted_echo, &pasted_texts);
+                    replace_repl_input_with_user_echo(
+                        &mut stdout,
+                        input_row,
+                        rendered_rows,
+                        mode,
+                        &submitted_echo,
+                    )?;
                     execute!(stdout, DisableBracketedPaste)?;
                     terminal::disable_raw_mode()?;
                     return Ok(Some((mode, input, pasted_images)));
                 }
                 KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
                     insert_newline_at_cursor(&mut input, &mut cursor);
+                    history_clean_index = None;
                     is_pasted = false;
                     render_repl_input(
                         &mut stdout,
@@ -2075,6 +2453,7 @@ fn read_repl_input(
                     if !input.is_empty() {
                         input.clear();
                         cursor = 0;
+                        history_clean_index = None;
                         is_pasted = false;
                         pasted_images.clear();
                         pasted_texts.clear();
@@ -2131,6 +2510,7 @@ fn read_repl_input(
                     } else {
                         remove_word_before_cursor(&mut input, &mut cursor);
                     }
+                    history_clean_index = None;
                     is_pasted = false;
                     render_repl_input(
                         &mut stdout,
@@ -2158,6 +2538,7 @@ fn read_repl_input(
                         } else {
                             remove_char_before_cursor(&mut input, &mut cursor);
                         }
+                        history_clean_index = None;
                     }
                     is_pasted = false;
                     render_repl_input(
@@ -2183,6 +2564,7 @@ fn read_repl_input(
                     } else {
                         remove_char_at_cursor(&mut input, cursor);
                     }
+                    history_clean_index = None;
                     is_pasted = false;
                     render_repl_input(
                         &mut stdout,
@@ -2219,6 +2601,7 @@ fn read_repl_input(
                                 Err(_) => format!("[Image {}]", index),
                             };
                             insert_str_at_cursor(&mut input, &mut cursor, &placeholder);
+                            history_clean_index = None;
                             pasted_images.push(Some(crate::clipboard::PastedImage::Binary(img)));
                             is_pasted = false;
                             render_repl_input(
@@ -2239,6 +2622,7 @@ fn read_repl_input(
                                 .unwrap_or("image");
                             let placeholder = format!("[Image {}: {}]", index, filename);
                             insert_str_at_cursor(&mut input, &mut cursor, &placeholder);
+                            history_clean_index = None;
                             pasted_images.push(Some(crate::clipboard::PastedImage::Path(path)));
                             is_pasted = false;
                             render_repl_input(
@@ -2253,6 +2637,7 @@ fn read_repl_input(
                         }
                         Ok(crate::clipboard::ClipboardContent::TextPath(path)) => {
                             insert_str_at_cursor(&mut input, &mut cursor, &path);
+                            history_clean_index = None;
                             is_pasted = false;
                             render_repl_input(
                                 &mut stdout,
@@ -2272,6 +2657,7 @@ fn read_repl_input(
                                     text,
                                     &mut pasted_texts,
                                 );
+                                history_clean_index = None;
                                 is_pasted = true;
                                 render_repl_input(
                                     &mut stdout,
@@ -2292,6 +2678,7 @@ fn read_repl_input(
                             cursor = end;
                         }
                         insert_char_at_cursor(&mut input, &mut cursor, ch);
+                        history_clean_index = None;
                     }
                     is_pasted = false;
                     render_repl_input(
@@ -2311,7 +2698,7 @@ fn read_repl_input(
     }
 }
 
-fn render_repl_input(
+fn render_repl_input_with_footer(
     stdout: &mut io::Stdout,
     input_row: &mut u16,
     rendered_rows: &mut u16,
@@ -2319,22 +2706,28 @@ fn render_repl_input(
     input: &str,
     cursor: usize,
     is_pasted: bool,
+    footer: &ReplFooterStatus,
+    show_shortcut_hint: bool,
 ) -> Result<()> {
     let suggestions = repl_command_suggestions(input);
     let lines = repl_input_lines(input);
-    let prompt_prefix = format!("{} > ", colored_mode_label(mode));
-    let plain_prefix = format!("[{}] > ", mode.label());
+    let prompt_prefix = input_prompt_bar(mode);
+    let plain_prefix = "  ";
+    let cols = terminal_cols();
     let display_lines = repl_visible_input_lines(
         &plain_prefix,
         &lines,
         REPL_MAX_VISIBLE_INPUT_ROWS,
         is_pasted,
     );
-    let display_lines: Vec<String> = display_lines
+    let display_rows = repl_wrapped_input_rows_for_cols(&plain_prefix, &display_lines, cols);
+    let display_rows: Vec<String> = display_rows
         .iter()
         .map(|line| colorize_repl_placeholders(line))
         .collect();
-    let current_rows = repl_render_rows(&plain_prefix, &display_lines, !suggestions.is_empty());
+    let input_rows = display_rows.len().max(1).min(u16::MAX as usize) as u16;
+    let show_hint = show_shortcut_hint && suggestions.is_empty();
+    let current_rows = input_rows.saturating_add(if show_hint { 4 } else { 3 });
     let rows_to_clear = (*rendered_rows).max(current_rows).max(1);
     ensure_repl_space(stdout, input_row, rows_to_clear)?;
     for row_offset in 0..rows_to_clear {
@@ -2345,31 +2738,56 @@ fn render_repl_input(
         )?;
     }
     let mut row_offset = 0u16;
-    for (index, line) in display_lines.iter().enumerate() {
+    queue!(stdout, MoveTo(0, *input_row), Print(&prompt_prefix))?;
+    row_offset = row_offset.saturating_add(1);
+    for line in &display_rows {
         let row = (*input_row).saturating_add(row_offset);
         queue!(stdout, MoveTo(0, row))?;
-        if index == 0 {
-            queue!(stdout, Print(&prompt_prefix), Print(line))?;
-            row_offset = row_offset.saturating_add(repl_line_rows(&plain_prefix, line));
-        } else {
-            queue!(stdout, Print(line))?;
-            row_offset = row_offset.saturating_add(repl_line_rows("", line));
-        }
+        queue!(stdout, Print(&prompt_prefix), Print(line))?;
+        row_offset = row_offset.saturating_add(1);
     }
+    queue!(
+        stdout,
+        MoveTo(0, (*input_row).saturating_add(row_offset)),
+        Print(&prompt_prefix)
+    )?;
+    row_offset = row_offset.saturating_add(1);
     if !suggestions.is_empty() {
-        let suggestion_row =
-            (*input_row).saturating_add(repl_prompt_rows(&plain_prefix, &display_lines));
+        let suggestion_width = cols.saturating_sub(visible_width(&prompt_prefix)).max(1);
         queue!(
             stdout,
-            MoveTo(0, suggestion_row),
-            Print(format!("\x1b[2m{}\x1b[0m", suggestions.join("  ")))
+            MoveTo(0, (*input_row).saturating_add(row_offset)),
+            Print(&prompt_prefix),
+            Print(format!(
+                "\x1b[2m{}\x1b[0m",
+                repl_command_suggestions_line(&suggestions, suggestion_width)
+            ))
         )?;
+    } else {
+        queue!(
+            stdout,
+            MoveTo(0, (*input_row).saturating_add(row_offset)),
+            Print(repl_footer_line(mode, footer, cols))
+        )?;
+        if show_hint {
+            row_offset = row_offset.saturating_add(1);
+            queue!(
+                stdout,
+                MoveTo(0, (*input_row).saturating_add(row_offset)),
+                Print(repl_shortcut_hint_line(mode, cols))
+            )?;
+        }
     }
     let (cursor_col, cursor_row_offset) = if display_lines.len() == lines.len() {
         repl_cursor_position(&plain_prefix, input, cursor)
     } else {
         let last_line = display_lines.last().map(String::as_str).unwrap_or_default();
-        let col = (visible_width(last_line) % terminal_cols()) as u16;
+        let (col, _) = repl_cursor_position_for_line_for_cols(
+            &plain_prefix,
+            last_line,
+            last_line.chars().count(),
+            terminal_cols(),
+        );
         (
             col,
             repl_prompt_rows(&plain_prefix, &display_lines).saturating_sub(1),
@@ -2377,7 +2795,12 @@ fn render_repl_input(
     };
     queue!(
         stdout,
-        MoveTo(cursor_col, (*input_row).saturating_add(cursor_row_offset))
+        MoveTo(
+            cursor_col,
+            (*input_row)
+                .saturating_add(1)
+                .saturating_add(cursor_row_offset)
+        )
     )?;
     stdout.flush()?;
     *rendered_rows = current_rows;
@@ -2434,8 +2857,243 @@ fn move_after_repl_input(
     Ok(())
 }
 
-fn repl_render_rows(prefix: &str, lines: &[String], has_suggestions: bool) -> u16 {
-    repl_prompt_rows_for_cols(prefix, lines, terminal_cols()) + u16::from(has_suggestions)
+fn replace_repl_input_with_user_echo(
+    stdout: &mut io::Stdout,
+    input_row: u16,
+    rendered_rows: u16,
+    mode: AgentMode,
+    input: &str,
+) -> Result<()> {
+    let cols = terminal_cols();
+    let echo_lines = submitted_echo_lines(mode, input.trim_end(), cols);
+    let echo_rows = echo_lines.len().min(u16::MAX as usize) as u16;
+    let rows_to_clear = rendered_rows.max(echo_rows).max(1);
+    for row_offset in 0..rows_to_clear {
+        queue!(
+            stdout,
+            MoveTo(0, input_row.saturating_add(row_offset)),
+            Clear(ClearType::CurrentLine)
+        )?;
+    }
+    for (offset, line) in echo_lines.iter().enumerate() {
+        queue!(
+            stdout,
+            MoveTo(
+                0,
+                input_row.saturating_add(offset.min(u16::MAX as usize) as u16)
+            ),
+            Print(line)
+        )?;
+    }
+    queue!(
+        stdout,
+        MoveTo(0, input_row.saturating_add(echo_rows).saturating_add(1))
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn submitted_echo_lines(mode: AgentMode, input: &str, cols: usize) -> Vec<String> {
+    let max_text_width = cols.saturating_sub(3).max(1);
+    let bar = submitted_echo_bar(mode);
+    let mut output = Vec::new();
+    output.push(bar.clone());
+    for line in input.split('\n') {
+        let mut chunks = wrap_visible_width(line, max_text_width);
+        if chunks.is_empty() {
+            chunks.push(String::new());
+        }
+        for chunk in chunks {
+            output.push(format!("{bar} {}", colorize_repl_placeholders(&chunk)));
+        }
+    }
+    output.push(bar);
+    output
+}
+
+fn submitted_echo_bar(mode: AgentMode) -> String {
+    match mode {
+        AgentMode::Normal => "\x1b[1m\x1b[34m┃\x1b[0m".to_string(),
+        AgentMode::Plan => "\x1b[1m\x1b[35m┃\x1b[0m".to_string(),
+        AgentMode::Chat => "\x1b[1m\x1b[32m┃\x1b[0m".to_string(),
+    }
+}
+
+fn input_prompt_bar(mode: AgentMode) -> String {
+    format!("{} ", submitted_echo_bar(mode))
+}
+
+fn repl_shortcut_hint_line(mode: AgentMode, cols: usize) -> String {
+    let bar = input_prompt_bar(mode);
+    let text = t(
+        "Tab switch mode; Ctrl+J newline; Ctrl+V paste clipboard",
+        "Tab 切换模式；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
+    );
+    let text_width = cols.saturating_sub(visible_width(&bar)).max(1);
+    format!(
+        "{bar}\x1b[2m{}\x1b[0m",
+        truncate_visible_width(text, text_width)
+    )
+}
+
+fn wrap_visible_width(value: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut width = 0usize;
+    for ch in value.chars() {
+        let char_width = visible_width(&ch.to_string());
+        if width > 0 && width.saturating_add(char_width) > max_width {
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+        }
+        current.push(ch);
+        width = width.saturating_add(char_width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn repl_wrapped_input_rows_for_cols(prefix: &str, lines: &[String], cols: usize) -> Vec<String> {
+    let max_width = repl_content_width_for_cols(prefix, cols);
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut current = String::new();
+        let mut width = 0usize;
+        for ch in line.chars() {
+            let char_width = visible_width(&ch.to_string());
+            if width > 0 && width.saturating_add(char_width) > max_width {
+                rows.push(std::mem::take(&mut current));
+                width = 0;
+            }
+            current.push(ch);
+            width = width.saturating_add(char_width);
+        }
+        rows.push(current);
+        if width > 0 && width % max_width == 0 {
+            rows.push(String::new());
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+fn repl_cursor_position_for_line_for_cols(
+    prefix: &str,
+    line: &str,
+    cursor: usize,
+    cols: usize,
+) -> (u16, u16) {
+    let cols = cols.max(1);
+    let prefix_width = repl_prefix_width_for_cols(prefix, cols);
+    let content_width = repl_content_width_for_cols(prefix, cols);
+    let mut col = 0usize;
+    let mut row = 0usize;
+    for ch in line.chars().take(cursor) {
+        let char_width = visible_width(&ch.to_string()).max(1);
+        if col > 0 && col.saturating_add(char_width) > content_width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        col = col.saturating_add(char_width);
+        if col >= content_width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+    }
+    (
+        prefix_width.saturating_add(col).min(u16::MAX as usize) as u16,
+        row.min(u16::MAX as usize) as u16,
+    )
+}
+
+fn repl_history_is_clean(
+    input: &str,
+    history: &[String],
+    history_clean_index: Option<usize>,
+) -> bool {
+    history_clean_index
+        .and_then(|index| history.get(index))
+        .map(|entry| entry == input)
+        .unwrap_or(false)
+}
+
+fn repl_should_browse_history(
+    input: &str,
+    history: &[String],
+    history_clean_index: Option<usize>,
+) -> bool {
+    input.is_empty() || repl_history_is_clean(input, history, history_clean_index)
+}
+
+fn repl_move_cursor_vertical(prefix: &str, input: &str, cursor: usize, direction: i32) -> usize {
+    if input.is_empty() || direction == 0 {
+        return cursor.min(input.chars().count());
+    }
+    repl_move_cursor_vertical_for_cols(prefix, input, cursor, direction, terminal_cols())
+}
+
+fn repl_move_cursor_vertical_for_cols(
+    prefix: &str,
+    input: &str,
+    cursor: usize,
+    direction: i32,
+    cols: usize,
+) -> usize {
+    let positions = repl_cursor_layout_positions_for_cols(prefix, input, cols);
+    let cursor = cursor.min(positions.len().saturating_sub(1));
+    let (_, current_row, current_col) = positions[cursor];
+    let last_row = positions.last().map(|(_, row, _)| *row).unwrap_or(0);
+    let target_row = if direction < 0 {
+        current_row.saturating_sub(1)
+    } else {
+        current_row.saturating_add(1).min(last_row)
+    };
+    if target_row == current_row {
+        return cursor;
+    }
+
+    positions
+        .iter()
+        .filter(|(_, row, _)| *row == target_row)
+        .min_by_key(|(index, _, col)| (col.abs_diff(current_col), usize::MAX - *index))
+        .map(|(index, _, _)| *index)
+        .unwrap_or(cursor)
+}
+
+fn repl_cursor_layout_positions_for_cols(
+    prefix: &str,
+    input: &str,
+    cols: usize,
+) -> Vec<(usize, usize, usize)> {
+    let content_width = repl_content_width_for_cols(prefix, cols);
+    let mut positions = Vec::with_capacity(input.chars().count() + 1);
+    let mut row = 0usize;
+    let mut col = 0usize;
+    positions.push((0, row, col));
+    for (index, ch) in input.chars().enumerate() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            col = 0;
+            positions.push((index + 1, row, col));
+            continue;
+        }
+        let char_width = visible_width(&ch.to_string()).max(1);
+        if col > 0 && col.saturating_add(char_width) > content_width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        col = col.saturating_add(char_width);
+        if col >= content_width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        positions.push((index + 1, row, col));
+    }
+    positions
 }
 
 fn repl_prompt_rows(prefix: &str, lines: &[String]) -> u16 {
@@ -2446,21 +3104,27 @@ fn repl_cursor_position(prefix: &str, input: &str, cursor: usize) -> (u16, u16) 
     repl_cursor_position_for_cols(prefix, input, cursor, terminal_cols())
 }
 
-fn repl_line_rows(prefix: &str, line: &str) -> u16 {
-    repl_line_rows_for_cols(prefix, line, terminal_cols())
+fn repl_line_rows_for_cols(prefix: &str, line: &str, cols: usize) -> u16 {
+    let content_width = repl_content_width_for_cols(prefix, cols);
+    let width = visible_width(line);
+    (width / content_width + 1).min(u16::MAX as usize) as u16
 }
 
-fn repl_line_rows_for_cols(prefix: &str, line: &str, cols: usize) -> u16 {
-    let cols = cols.max(1);
-    let width = visible_width(prefix) + visible_width(line);
-    (width / cols + 1).min(u16::MAX as usize) as u16
+fn repl_prefix_width_for_cols(prefix: &str, cols: usize) -> usize {
+    visible_width(prefix).min(cols.max(1).saturating_sub(1))
+}
+
+fn repl_content_width_for_cols(prefix: &str, cols: usize) -> usize {
+    cols.max(1)
+        .saturating_sub(repl_prefix_width_for_cols(prefix, cols))
+        .max(1)
 }
 
 fn repl_prompt_rows_for_cols(prefix: &str, lines: &[String], cols: usize) -> u16 {
     let cols = cols.max(1);
     let mut rows = 0usize;
-    for (index, line) in lines.iter().enumerate() {
-        rows += repl_line_rows_for_cols(if index == 0 { prefix } else { "" }, line, cols) as usize;
+    for line in lines {
+        rows += repl_line_rows_for_cols(prefix, line, cols) as usize;
     }
     rows.max(1).min(u16::MAX as usize) as u16
 }
@@ -2477,20 +3141,22 @@ fn repl_cursor_position_for_cols(
     let last_index = lines.len().saturating_sub(1);
     let mut row_offset = 0usize;
     for (index, line) in lines.iter().enumerate() {
-        let width = if index == 0 {
-            visible_width(prefix) + visible_width(line)
-        } else {
-            visible_width(line)
-        };
         if index == last_index {
+            let (col, row) =
+                repl_cursor_position_for_line_for_cols(prefix, line, line.chars().count(), cols);
             return (
-                (width % cols).min(u16::MAX as usize) as u16,
-                (row_offset + width / cols).min(u16::MAX as usize) as u16,
+                col,
+                row_offset
+                    .saturating_add(row as usize)
+                    .min(u16::MAX as usize) as u16,
             );
         }
-        row_offset += width / cols + 1;
+        row_offset += repl_line_rows_for_cols(prefix, line, cols) as usize;
     }
-    (visible_width(prefix).min(u16::MAX as usize) as u16, 0)
+    (
+        repl_prefix_width_for_cols(prefix, cols).min(u16::MAX as usize) as u16,
+        0,
+    )
 }
 
 fn insert_char_at_cursor(value: &mut String, cursor: &mut usize, ch: char) {
@@ -2875,26 +3541,9 @@ fn colorize_repl_placeholders(line: &str) -> String {
     result
 }
 
-fn colored_mode_label(mode: AgentMode) -> String {
-    let label = mode.label();
-    match mode {
-        AgentMode::Normal => format!("\x1b[1m\x1b[34m[{label}]\x1b[0m"),
-        AgentMode::Plan => format!("\x1b[1m\x1b[36m[{label}]\x1b[0m"),
-        AgentMode::Chat => format!("\x1b[1m\x1b[32m[{label}]\x1b[0m"),
-    }
-}
-
-fn repl_commands() -> [&'static str; 9] {
+fn repl_commands() -> [&'static str; 7] {
     [
-        "/providers",
-        "/config",
-        "/plan",
-        "/normal",
-        "/chat",
-        "/undo",
-        "/reset",
-        "/help",
-        "/exit",
+        "/models", "/config", "/undo", "/compact", "/reset", "/help", "/exit",
     ]
 }
 
@@ -2915,6 +3564,44 @@ fn complete_repl_command(input: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn resolve_repl_command<'a>(input: &'a str) -> &'a str {
+    if input.starts_with('/') {
+        if let Some(command) = complete_repl_command(input) {
+            return command;
+        }
+    }
+    input
+}
+
+fn repl_command_suggestions_line(suggestions: &[&str], max_width: usize) -> String {
+    let line = if suggestions.len() == 1 {
+        suggestions[0].to_string()
+    } else {
+        suggestions.join("  ")
+    };
+    truncate_visible_width(&line, max_width)
+}
+
+fn truncate_visible_width(value: &str, max_width: usize) -> String {
+    if visible_width(value) <= max_width {
+        return value.to_string();
+    }
+    let mut output = String::new();
+    let mut width = 0usize;
+    let ellipsis_width = visible_width("...");
+    let budget = max_width.saturating_sub(ellipsis_width);
+    for ch in value.chars() {
+        let ch_width = visible_width(&ch.to_string());
+        if width.saturating_add(ch_width) > budget {
+            break;
+        }
+        output.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+    output.push_str("...");
+    output
 }
 
 #[cfg(test)]
@@ -2943,8 +3630,150 @@ mod repl_input_tests {
     }
 
     #[test]
+    fn cursor_position_keeps_prefix_after_newline() {
+        assert_eq!(repl_cursor_position_for_cols("  ", "123\n", 4, 10), (2, 1));
+        assert_eq!(
+            repl_cursor_position_for_cols("  ", "123\n456", 7, 10),
+            (5, 1)
+        );
+    }
+
+    #[test]
+    fn prompt_rows_include_prefix_on_each_line() {
+        assert_eq!(
+            repl_prompt_rows_for_cols("  ", &["12".into(), "34".into()], 5),
+            2
+        );
+        assert_eq!(
+            repl_prompt_rows_for_cols("  ", &["123".into(), "34".into()], 5),
+            3
+        );
+    }
+
+    #[test]
+    fn wrapped_input_rows_keep_prefix_outside_content_width() {
+        assert_eq!(
+            repl_wrapped_input_rows_for_cols("  ", &["123456789".into()], 10),
+            vec!["12345678".to_string(), "9".to_string()]
+        );
+        assert_eq!(
+            repl_wrapped_input_rows_for_cols("  ", &["12345678".into()], 10),
+            vec!["12345678".to_string(), String::new()]
+        );
+        assert_eq!(
+            repl_cursor_position_for_cols("  ", "12345678", 8, 10),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn history_browsing_requires_empty_or_clean_history_input() {
+        let history = vec!["first".to_string(), "second".to_string()];
+
+        assert!(repl_should_browse_history("", &history, None));
+        assert!(repl_should_browse_history("second", &history, Some(1)));
+        assert!(!repl_should_browse_history("draft", &history, None));
+        assert!(!repl_should_browse_history(
+            "second edited",
+            &history,
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn vertical_cursor_move_uses_soft_wrapped_rows() {
+        assert_eq!(
+            repl_move_cursor_vertical_for_cols("  ", "123456789", 9, -1, 10),
+            1
+        );
+        assert_eq!(
+            repl_move_cursor_vertical_for_cols("  ", "123456789", 1, 1, 10),
+            9
+        );
+    }
+
+    #[test]
+    fn vertical_cursor_move_handles_explicit_newlines() {
+        assert_eq!(
+            repl_move_cursor_vertical_for_cols("  ", "abc\ndef", 6, -1, 20),
+            2
+        );
+        assert_eq!(
+            repl_move_cursor_vertical_for_cols("  ", "abc\ndef", 2, 1, 20),
+            6
+        );
+    }
+
+    #[test]
+    fn vertical_cursor_move_handles_wide_chars_near_wrap() {
+        assert_eq!(
+            repl_cursor_position_for_cols("  ", "1234567你", 8, 11),
+            (2, 1)
+        );
+        assert_eq!(
+            repl_cursor_position_for_cols("  ", "12345678你", 9, 11),
+            (4, 1)
+        );
+        assert_eq!(
+            repl_move_cursor_vertical_for_cols("  ", "12345678你好", 9, -1, 11),
+            2
+        );
+    }
+
+    #[test]
     fn reset_is_a_repl_command() {
         assert!(repl_commands().contains(&"/reset"));
+    }
+
+    #[test]
+    fn compact_is_a_repl_command() {
+        assert!(repl_commands().contains(&"/compact"));
+    }
+
+    #[test]
+    fn command_suggestions_are_prefixed_and_truncated() {
+        let suggestions = repl_command_suggestions("/");
+        let line = repl_command_suggestions_line(&suggestions, 24);
+        assert!(line.starts_with("/models"));
+        assert!(visible_width(&line) <= 24);
+
+        let line = repl_command_suggestions_line(&["/compact"], 40);
+        assert_eq!(line, "/compact");
+    }
+
+    #[test]
+    fn shortcut_hint_line_is_bar_aligned_and_truncated() {
+        let line = repl_shortcut_hint_line(AgentMode::Normal, 24);
+        assert!(strip_terminal_control_sequences(&line).contains("Tab"));
+        assert!(visible_width(&line) <= 24);
+    }
+
+    #[test]
+    fn inline_fuzzy_lines_are_bar_aligned_and_truncated() {
+        let header = inline_fuzzy_header("big", 12);
+        assert!(strip_terminal_control_sequences(&header).contains("选择模型"));
+        assert!(visible_width(&header) <= 12);
+
+        let item = inline_fuzzy_item_line("opencode Zen / big-pickle", true, false, 16);
+        assert!(strip_terminal_control_sequences(&item).starts_with("› opencode"));
+        assert!(visible_width(&item) <= 16);
+
+        let item = inline_fuzzy_item_line("opencode Zen / big-pickle", false, true, 18);
+        assert!(strip_terminal_control_sequences(&item).starts_with("  opencode"));
+        assert!(visible_width(&item) <= 18);
+
+        let help = inline_fuzzy_help_line(40);
+        let help_plain = strip_terminal_control_sequences(&help);
+        assert!(help_plain.contains("j/k"));
+        assert!(visible_width(&help) <= 40);
+    }
+
+    #[test]
+    fn partial_slash_command_resolves_unique_match() {
+        assert_eq!(resolve_repl_command("/model"), "/models");
+        assert_eq!(resolve_repl_command("/compa"), "/compact");
+        assert_eq!(resolve_repl_command("/co"), "/co");
+        assert_eq!(resolve_repl_command("hello"), "hello");
     }
 
     #[test]
@@ -3383,17 +4212,15 @@ fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
         memory.clear_pending_events()?;
     }
     tools::clear_aur_review_state(paths)?;
-    println!(
-        "{}",
-        if all {
-            t(
-                "cleared current conversation history and all memory",
-                "已清空当前会话历史与全部记忆",
-            )
-        } else {
-            t("cleared current conversation history", "已清空当前会话历史")
-        }
-    );
+    let message = if all {
+        t(
+            "cleared current conversation history and all memory",
+            "已清空当前会话历史与全部记忆",
+        )
+    } else {
+        t("cleared current conversation history", "已清空当前会话历史")
+    };
+    println!("\x1b[2m{message}\x1b[0m\n");
     Ok(())
 }
 

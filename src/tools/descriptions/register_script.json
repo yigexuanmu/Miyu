@@ -16,11 +16,11 @@
       },
       "description": {
         "type": "string",
-        "description": "展示给 AI 的工具描述。"
+        "description": "展示给 AI 的工具描述。省略时读取脚本头部的 Description/描述元数据；两者都没有时注册失败。"
       },
       "path": {
         "type": "string",
-        "description": "脚本文件名或相对/绝对路径。"
+        "description": "用户 scripts 目录内的脚本文件名或路径。"
       },
       "parameters": {
         "type": "object",
@@ -29,15 +29,21 @@
       "timeout_seconds": {
         "type": "integer",
         "description": "可选超时时间，单位秒，最大 300。"
+      },
+      "always_loaded": {
+        "type": "boolean",
+        "description": "可选加载策略覆盖。默认有自定义 schema 的脚本按需加载，使用通用 stdin 的脚本始终可见。"
       }
     },
     "required": [
       "id",
-      "display_name",
-      "description",
       "path"
     ]
   },
   "permission": "writes",
-  "always_loaded": false
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "scripting"
+  ]
 }

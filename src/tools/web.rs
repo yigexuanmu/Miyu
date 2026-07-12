@@ -90,10 +90,11 @@ async fn web_search(args: Value, config: WebPluginConfig) -> Result<String> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
     let order: Vec<&str> = if provider == "auto" {
-        vec!["tavily", "firecrawl", "anysearch", "searxng", "script"]
+        vec!["tavily", "firecrawl", "anysearch", "searxng", "duckduckgo"]
     } else {
         vec![provider]
     };
+    let mut errors = Vec::new();
     for item in order {
         let result = match item {
             "tavily" => search_tavily(&client, query, max_results, &config.tavily_api_keys).await,
@@ -106,16 +107,21 @@ async fn web_search(args: Value, config: WebPluginConfig) -> Result<String> {
             "searxng" => {
                 search_searxng(&client, query, max_results, &config.searxng_base_url).await
             }
-            "script" => search_duckduckgo(&client, query, max_results).await,
-            _ => continue,
-        };
-        if let Ok(output) = result {
-            if !output.trim().is_empty() {
-                return Ok(output);
+            "duckduckgo" | "script" => search_duckduckgo(&client, query, max_results).await,
+            _ => {
+                errors.push(format!("{item}: unknown provider"));
+                continue;
             }
+        };
+        match result {
+            Ok(output) => return Ok(output),
+            Err(err) => errors.push(format!("{item}: {err}")),
         }
     }
-    bail!("no web search provider succeeded; API keys missing/failed, SearXNG unavailable, and built-in DuckDuckGo fallback (with Yahoo/360/Sogou) returned no results")
+    bail!(
+        "no web search provider succeeded:\n- {}",
+        errors.join("\n- ")
+    )
 }
 
 async fn search_tavily(
@@ -124,27 +130,62 @@ async fn search_tavily(
     max_results: usize,
     keys: &[String],
 ) -> Result<String> {
-    let Some(key) = keys.iter().find(|key| !key.trim().is_empty()) else {
+    let keys = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
         bail!("missing Tavily API key")
-    };
+    }
     let payload = json!({"query": query, "max_results": max_results.min(20), "search_depth": "basic", "include_answer": false, "include_raw_content": "markdown"});
-    let data: Value = client
-        .post("https://api.tavily.com/search")
-        .bearer_auth(key.trim())
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(format_search_results(
-        query,
-        "Tavily",
-        data.get("results")
+    let mut errors = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let response = match client
+            .post("https://api.tavily.com/search")
+            .bearer_auth(*key)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                errors.push(format!("key#{} request failed: {err}", index + 1));
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            errors.push(format!(
+                "key#{} HTTP {}: {}",
+                index + 1,
+                status.as_u16(),
+                clip(&body, 240)
+            ));
+            continue;
+        }
+        let data: Value = match response.json().await {
+            Ok(data) => data,
+            Err(err) => {
+                errors.push(format!("key#{} invalid JSON: {err}", index + 1));
+                continue;
+            }
+        };
+        let results = data
+            .get("results")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default(),
-    ))
+            .unwrap_or_default();
+        match format_search_results(query, "Tavily", results) {
+            Ok(output) => return Ok(output),
+            Err(err) => errors.push(format!("key#{}: {err}", index + 1)),
+        }
+    }
+    bail!(
+        "Tavily failed for all configured keys: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn search_firecrawl(
@@ -153,25 +194,58 @@ async fn search_firecrawl(
     max_results: usize,
     keys: &[String],
 ) -> Result<String> {
-    let Some(key) = keys.iter().find(|key| !key.trim().is_empty()) else {
+    let keys = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
         bail!("missing Firecrawl API key")
-    };
+    }
     let payload = json!({"query": query, "limit": max_results.min(20), "sources": [{"type":"web"}], "scrapeOptions": {"formats": [{"type":"markdown"}], "onlyMainContent": true}});
-    let data: Value = client
-        .post("https://api.firecrawl.dev/v2/search")
-        .bearer_auth(key.trim())
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let raw = data
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(format_search_results(query, "Firecrawl", raw))
+    let mut errors = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let response = match client
+            .post("https://api.firecrawl.dev/v2/search")
+            .bearer_auth(*key)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                errors.push(format!("key#{} request failed: {err}", index + 1));
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            errors.push(format!(
+                "key#{} HTTP {}: {}",
+                index + 1,
+                status.as_u16(),
+                clip(&body, 240)
+            ));
+            continue;
+        }
+        let data: Value = match response.json().await {
+            Ok(data) => data,
+            Err(err) => {
+                errors.push(format!("key#{} invalid JSON: {err}", index + 1));
+                continue;
+            }
+        };
+        let raw = firecrawl_results(&data, max_results);
+        match format_search_results(query, "Firecrawl", raw) {
+            Ok(output) => return Ok(output),
+            Err(err) => errors.push(format!("key#{}: {err}", index + 1)),
+        }
+    }
+    bail!(
+        "Firecrawl failed for all configured keys: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn search_anysearch(
@@ -180,27 +254,58 @@ async fn search_anysearch(
     max_results: usize,
     keys: &[String],
 ) -> Result<String> {
-    let Some(key) = keys.iter().find(|key| !key.trim().is_empty()) else {
+    let keys = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
         bail!("missing AnySearch API key")
-    };
+    }
     let payload = json!({"query": query, "max_results": max_results.min(20)});
-    let data: Value = client
-        .post("https://api.anysearch.com/v1/search")
-        .bearer_auth(key.trim())
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(format_search_results(
-        query,
-        "AnySearch",
-        data.get("results")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-    ))
+    let mut errors = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let response = match client
+            .post("https://api.anysearch.com/v1/search")
+            .bearer_auth(*key)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                errors.push(format!("key#{} request failed: {err}", index + 1));
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            errors.push(format!(
+                "key#{} HTTP {}: {}",
+                index + 1,
+                status.as_u16(),
+                clip(&body, 240)
+            ));
+            continue;
+        }
+        let data: Value = match response.json().await {
+            Ok(data) => data,
+            Err(err) => {
+                errors.push(format!("key#{} invalid JSON: {err}", index + 1));
+                continue;
+            }
+        };
+        let raw = anysearch_results(&data, max_results);
+        match format_search_results(query, "AnySearch", raw) {
+            Ok(output) => return Ok(output),
+            Err(err) => errors.push(format!("key#{}: {err}", index + 1)),
+        }
+    }
+    bail!(
+        "AnySearch failed for all configured keys: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn search_searxng(
@@ -236,7 +341,7 @@ async fn search_searxng(
     if results.is_empty() {
         bail!("SearXNG returned no results")
     }
-    Ok(format_search_results(query, "SearXNG", results))
+    format_search_results(query, "SearXNG", results)
 }
 
 // ── Crawler helper functions ───────────────────────────────────
@@ -985,12 +1090,40 @@ fn html_unescape(value: &str) -> String {
         .replace("&gt;", ">")
 }
 
-fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> String {
+fn firecrawl_results(data: &Value, max_results: usize) -> Vec<Value> {
+    let data_value = data.get("data").unwrap_or(data);
+    let results = data_value
+        .as_array()
+        .or_else(|| data_value.get("web").and_then(Value::as_array))
+        .or_else(|| data_value.get("results").and_then(Value::as_array));
+    results
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(max_results)
+        .collect()
+}
+
+fn anysearch_results(data: &Value, max_results: usize) -> Vec<Value> {
+    let results = data
+        .get("results")
+        .and_then(Value::as_array)
+        .or_else(|| data.pointer("/data/results").and_then(Value::as_array));
+    results
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(max_results)
+        .collect()
+}
+
+fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> Result<String> {
     let mut lines = vec![
         format!("## Search results for: {query}"),
         format!("**Provider**: {provider}\n"),
     ];
-    for (index, item) in results.into_iter().enumerate() {
+    let mut rendered = 0usize;
+    for item in results.into_iter() {
         let title = item
             .get("title")
             .or_else(|| item.pointer("/metadata/title"))
@@ -1011,9 +1144,14 @@ fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> St
         let raw = item
             .get("raw_content")
             .or_else(|| item.get("markdown"))
+            .or_else(|| item.get("contentMarkdown"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        lines.push(format!("### {}. {title}", index + 1));
+        if title == "Untitled" && url.is_empty() && snippet.is_empty() && raw.is_empty() {
+            continue;
+        }
+        rendered += 1;
+        lines.push(format!("### {}. {title}", rendered));
         if !url.is_empty() {
             lines.push(format!("**URL**: {url}"));
         }
@@ -1025,7 +1163,10 @@ fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> St
         }
         lines.push(String::new());
     }
-    lines.join("\n")
+    if rendered == 0 {
+        bail!("{provider} returned no usable results")
+    }
+    Ok(lines.join("\n"))
 }
 
 fn clip(value: &str, max_chars: usize) -> String {

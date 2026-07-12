@@ -19,6 +19,7 @@ mod prompts;
 mod render;
 mod shell;
 mod state;
+mod token_estimate;
 mod tools;
 
 use anyhow::Result;

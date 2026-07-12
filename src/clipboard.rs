@@ -1,6 +1,7 @@
 use anyhow::Result;
 use base64::Engine;
 use sha2::Digest;
+use std::cell::OnceCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,6 +12,7 @@ const CLIPBOARD_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 pub struct ClipboardImage {
     pub mime: String,
     pub data: Vec<u8>,
+    data_url: OnceCell<String>,
 }
 
 pub enum PastedImage {
@@ -19,9 +21,21 @@ pub enum PastedImage {
 }
 
 impl ClipboardImage {
+    pub fn new(mime: String, data: Vec<u8>) -> Self {
+        Self {
+            mime,
+            data,
+            data_url: OnceCell::new(),
+        }
+    }
+
     pub fn data_url(&self) -> String {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.data);
-        format!("data:{};base64,{}", self.mime, encoded)
+        self.data_url
+            .get_or_init(|| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&self.data);
+                format!("data:{};base64,{}", self.mime, encoded)
+            })
+            .clone()
     }
 
     pub fn write_temp_file(&self, cache_dir: &std::path::Path, _index: usize) -> Result<PathBuf> {
@@ -71,10 +85,7 @@ fn try_command(cmd: &str, args: &[&str], mime: &str) -> Result<Option<ClipboardI
             if output.stdout.len() > MAX_CLIPBOARD_IMAGE_BYTES {
                 return Ok(None);
             }
-            Ok(Some(ClipboardImage {
-                mime: mime.to_string(),
-                data: output.stdout,
-            }))
+            Ok(Some(ClipboardImage::new(mime.to_string(), output.stdout)))
         }
         _ => Ok(None),
     }
@@ -87,6 +98,7 @@ pub enum ClipboardContent {
     Image(ClipboardImage),
     ImagePath(String),
     TextPath(String),
+    Text(String),
 }
 
 pub fn read_clipboard() -> Result<ClipboardContent> {
@@ -97,11 +109,10 @@ pub fn read_clipboard() -> Result<ClipboardContent> {
             || t == "application/glfw+clipboard-32678"
     });
     let has_image = targets.iter().any(|t| t.starts_with("image/"));
-    if has_uri_list
-        || targets
-            .iter()
-            .any(|t| t == "text/plain" || t == "TEXT" || t == "STRING" || t == "UTF8_STRING")
-    {
+    let has_text = targets
+        .iter()
+        .any(|t| t == "text/plain" || t == "TEXT" || t == "STRING" || t == "UTF8_STRING");
+    if has_uri_list || has_text {
         if let Some(text) = read_clipboard_text()? {
             if has_uri_list || text.starts_with("file://") || text.starts_with('/') {
                 if let Some(cp) = parse_clipboard_path(&text) {
@@ -111,6 +122,9 @@ pub fn read_clipboard() -> Result<ClipboardContent> {
                         return Ok(ClipboardContent::TextPath(cp.path));
                     }
                 }
+            }
+            if has_text {
+                return Ok(ClipboardContent::Text(text));
             }
         }
     }

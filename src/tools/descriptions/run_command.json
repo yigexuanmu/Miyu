@@ -19,5 +19,9 @@
     ]
   },
   "permission": "readonly",
-  "always_loaded": true
+  "always_loaded": true,
+  "load_policy": "summary",
+  "groups": [
+    "shell"
+  ]
 }

@@ -364,6 +364,7 @@ emit_row() {
 collect_all_rows() {
   local pid ppid user cpu mem_pct rss_kb comm args
   local -a ps_args=(
+    ww
     -eo
     pid=,ppid=,user=,pcpu=,pmem=,rss=,comm=,args=
     --no-headers
@@ -379,10 +380,14 @@ collect_app_rows() {
   local pid ppid user cpu mem_pct rss_kb comm args argv0 argv0_base
   local exe_base exe_path matched name row
   local -a ps_args=(
+    ww
     -eo
     pid=,ppid=,user=,pcpu=,pmem=,rss=,comm=,args=
     --no-headers
   )
+  local -a name_parts=()
+
+  IFS='|' read -r -a name_parts <<< "$names"
 
   while read -r pid ppid user cpu mem_pct rss_kb comm args; do
     [[ -n "$pid" && -n "$args" ]] || continue
@@ -393,6 +398,14 @@ collect_app_rows() {
     argv0_base="${argv0##*/}"
     matched=0
 
+    if [[ -n "$expected_exec" ]]; then
+      exe_base="${expected_exec##*/}"
+      exe_path="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+      if [[ "$exe_path" == "$expected_exec" ]]; then
+        matched=1
+      fi
+    fi
+
     if [[ -n "$expected_base" ]]; then
       same_token "$comm" "$expected_base" && matched=1
       same_token "$argv0_base" "$expected_base" && matched=1
@@ -401,7 +414,6 @@ collect_app_rows() {
     same_token "$comm" "$query" && matched=1
     same_token "$argv0_base" "$query" && matched=1
 
-    IFS='|' read -r -a name_parts <<< "$names"
     for name in "${name_parts[@]}"; do
       name="$(trim "$name")"
       [[ -n "$name" ]] || continue
@@ -416,15 +428,6 @@ collect_app_rows() {
     fi
 
     (( matched == 1 )) || continue
-
-    if [[ -n "$expected_exec" ]]; then
-      exe_base="${expected_exec##*/}"
-      exe_path="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
-      [[ "$exe_path" == "$expected_exec" ]] || continue
-      if ! same_token "$comm" "$exe_base" && ! same_token "$argv0_base" "$exe_base" && ! same_token "$comm" "$query" && ! same_token "$argv0_base" "$query"; then
-        continue
-      fi
-    fi
 
     row="$(emit_row "$cpu" "$mem_pct" "$rss_kb" "$pid" "$ppid" "$user" "$comm" "$args")"
     [[ -n "$row" ]] && printf '%s\n' "$row"

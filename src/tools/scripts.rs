@@ -1,9 +1,12 @@
+use super::registry::UnregisteredScript;
 use super::{ToolRegistry, ToolSpec};
 use crate::i18n::{is_zh, text as t};
 use crate::paths::MiyuPaths;
+use crate::tools::tool_descriptions::LoadPolicy;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -15,6 +18,14 @@ const MAX_SCRIPT_OUTPUT_CHARS: usize = 20_000;
 struct ScriptIndex {
     #[serde(default)]
     scripts: Vec<ScriptEntry>,
+    #[serde(default)]
+    disabled: Vec<DisabledScript>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DisabledScript {
+    id: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +40,18 @@ struct ScriptEntry {
     parameters: Value,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    #[serde(default)]
+    always_loaded: Option<bool>,
+    #[serde(default)]
+    load_policy: LoadPolicy,
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScriptScanResult {
+    entries: Vec<ScriptEntry>,
+    unregistered: Vec<UnregisteredScript>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,20 +77,11 @@ pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
         paths.system_scripts_dir.as_path(),
         paths.scripts_dir.as_path(),
     ];
-    let entries = match scan_scripts(&dirs) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        if let Ok(spec) = entry_to_spec(&entry, &paths.scripts_dir) {
-            registry.register(spec);
-        }
+    if let Ok(scan) = scan_scripts(&dirs) {
+        let specs = script_specs(&scan.entries, &paths.scripts_dir);
+        let _ = registry.replace_script_tools(specs, scan.unregistered);
     }
-    register_script_tools(
-        registry,
-        paths.scripts_dir.clone(),
-        paths.system_scripts_dir.clone(),
-    );
+    register_script_tools(registry, paths.scripts_dir.clone());
 }
 
 pub fn rescan_scripts(registry: &mut ToolRegistry, paths: &MiyuPaths) {
@@ -75,23 +89,25 @@ pub fn rescan_scripts(registry: &mut ToolRegistry, paths: &MiyuPaths) {
         paths.system_scripts_dir.as_path(),
         paths.scripts_dir.as_path(),
     ];
-    let entries = match scan_scripts(&dirs) {
-        Ok(e) => e,
+    let scan = match scan_scripts(&dirs) {
+        Ok(scan) => scan,
         Err(_) => return,
     };
-    for entry in entries {
-        if registry.get(&entry.id).is_none() {
-            if let Ok(spec) = entry_to_spec(&entry, &paths.scripts_dir) {
-                registry.register(spec);
-            }
-        }
-    }
+    let specs = script_specs(&scan.entries, &paths.scripts_dir);
+    let _ = registry.replace_script_tools(specs, scan.unregistered);
 }
 
-fn scan_scripts(dirs: &[&Path]) -> Result<Vec<ScriptEntry>> {
-    let mut entries: Vec<ScriptEntry> = Vec::new();
-    let mut id_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut seen_paths = std::collections::BTreeSet::new();
+fn script_specs(entries: &[ScriptEntry], scripts_dir: &Path) -> Vec<ToolSpec> {
+    entries
+        .iter()
+        .filter_map(|entry| entry_to_spec(entry, scripts_dir).ok())
+        .collect()
+}
+
+fn scan_scripts(dirs: &[&Path]) -> Result<ScriptScanResult> {
+    let mut entries = BTreeMap::<String, ScriptEntry>::new();
+    let mut unregistered = BTreeMap::<String, UnregisteredScript>::new();
+    let mut seen_paths = BTreeSet::new();
 
     for scripts_dir in dirs {
         if !scripts_dir.is_dir() {
@@ -99,31 +115,62 @@ fn scan_scripts(dirs: &[&Path]) -> Result<Vec<ScriptEntry>> {
         }
 
         let index_path = scripts_dir.join("index.json");
-        let indexed: Vec<ScriptEntry> = if index_path.is_file() {
-            let raw = std::fs::read_to_string(&index_path)?;
-            let index: ScriptIndex = serde_json::from_str(&raw).unwrap_or_default();
-            index.scripts
-        } else {
-            Vec::new()
-        };
+        let index = read_script_index_for_scan(&index_path)?;
 
-        for entry in &indexed {
-            let path = resolve_script_path(&entry.path, scripts_dir);
-            if !path.is_file() {
+        let mut disabled_ids = BTreeSet::new();
+        let mut disabled_paths = BTreeSet::new();
+        for disabled in &index.disabled {
+            if !disabled.id.trim().is_empty() {
+                disabled_ids.insert(disabled.id.clone());
+                entries.remove(&disabled.id);
+                unregistered.remove(&disabled.id);
+            }
+            if !disabled.path.trim().is_empty() {
+                disabled_paths.insert(canonicalize_key(&resolve_script_path(
+                    &disabled.path,
+                    scripts_dir,
+                )));
+            }
+        }
+
+        for indexed_entry in index.scripts {
+            if !is_valid_registered_script_id(&indexed_entry.id)
+                || disabled_ids.contains(&indexed_entry.id)
+                || is_reserved_script_id(&indexed_entry.id)
+            {
                 continue;
             }
+            let unresolved_path = resolve_script_path(&indexed_entry.path, scripts_dir);
+            if !unresolved_path.is_file() {
+                continue;
+            }
+            let path = match ensure_path_within_root(&unresolved_path, scripts_dir) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             let canon = canonicalize_key(&path);
+            if disabled_paths.contains(&canon) {
+                continue;
+            }
             seen_paths.insert(canon);
-            let mut entry = entry.clone();
+
+            let mut entry = indexed_entry;
             entry.path = path.to_string_lossy().to_string();
             if entry.description.trim().is_empty() {
-                entry.description = description_from_script(&path, &entry.id);
+                entry.description = description_from_script(&path).unwrap_or_default();
             }
-            if let Some(&idx) = id_index.get(&entry.id) {
-                entries[idx] = entry;
+            if entry.description.trim().is_empty() {
+                entries.remove(&entry.id);
+                unregistered.insert(
+                    entry.id.clone(),
+                    UnregisteredScript {
+                        name: entry.id,
+                        path: path.to_string_lossy().to_string(),
+                    },
+                );
             } else {
-                id_index.insert(entry.id.clone(), entries.len());
-                entries.push(entry);
+                unregistered.remove(&entry.id);
+                entries.insert(entry.id.clone(), entry);
             }
         }
 
@@ -137,23 +184,51 @@ fn scan_scripts(dirs: &[&Path]) -> Result<Vec<ScriptEntry>> {
             if fname == "index.json" || fname.starts_with('.') {
                 continue;
             }
-            if let Some(mut entry) = auto_detect_script(&path) {
-                let canon = canonicalize_key(&path);
-                if !seen_paths.insert(canon) {
-                    continue;
-                }
-                entry.path = path.to_string_lossy().to_string();
-                if let Some(&idx) = id_index.get(&entry.id) {
-                    entries[idx] = entry;
-                } else {
-                    id_index.insert(entry.id.clone(), entries.len());
-                    entries.push(entry);
-                }
+            let Some(detected) = inspect_script(&path) else {
+                continue;
+            };
+            if is_reserved_script_id(&detected.id) {
+                continue;
+            }
+            let canon = canonicalize_key(&path);
+            if disabled_ids.contains(&detected.id)
+                || disabled_paths.contains(&canon)
+                || !seen_paths.insert(canon)
+            {
+                continue;
+            }
+
+            if let Some(description) = detected.description {
+                let entry = ScriptEntry {
+                    id: detected.id.clone(),
+                    display_name: detected.display_name,
+                    description,
+                    path: path.to_string_lossy().to_string(),
+                    parameters: Value::Null,
+                    timeout_seconds: None,
+                    always_loaded: Some(true),
+                    load_policy: LoadPolicy::Summary,
+                    groups: Vec::new(),
+                };
+                unregistered.remove(&detected.id);
+                entries.insert(detected.id, entry);
+            } else {
+                entries.remove(&detected.id);
+                unregistered.insert(
+                    detected.id.clone(),
+                    UnregisteredScript {
+                        name: detected.id,
+                        path: path.to_string_lossy().to_string(),
+                    },
+                );
             }
         }
     }
 
-    Ok(entries)
+    Ok(ScriptScanResult {
+        entries: entries.into_values().collect(),
+        unregistered: unregistered.into_values().collect(),
+    })
 }
 
 fn canonicalize_key(path: &Path) -> PathBuf {
@@ -169,7 +244,58 @@ fn resolve_script_path(path_str: &str, scripts_dir: &Path) -> PathBuf {
     }
 }
 
-fn auto_detect_script(path: &Path) -> Option<ScriptEntry> {
+fn ensure_path_within_root(path: &Path, scripts_dir: &Path) -> Result<PathBuf> {
+    let root = scripts_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve scripts directory {}",
+            scripts_dir.display()
+        )
+    })?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve script path {}", path.display()))?;
+    if !path.starts_with(&root) {
+        bail!(
+            "script path must stay within the scripts directory: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn relative_script_path(path: &Path, scripts_dir: &Path) -> String {
+    let root = scripts_dir
+        .canonicalize()
+        .unwrap_or_else(|_| scripts_dir.to_path_buf());
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path.strip_prefix(&root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn is_reserved_script_id(id: &str) -> bool {
+    id == "load_tools" || super::tool_descriptions::get(id).is_some()
+}
+
+fn is_valid_registered_script_id(id: &str) -> bool {
+    id.chars()
+        .next()
+        .map(|character| character.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+#[derive(Debug, Clone)]
+struct DetectedScript {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+}
+
+fn inspect_script(path: &Path) -> Option<DetectedScript> {
     let raw = std::fs::read_to_string(path).ok()?;
     let first_line = raw.lines().next()?;
     if !first_line.starts_with("#!") {
@@ -183,29 +309,32 @@ fn auto_detect_script(path: &Path) -> Option<ScriptEntry> {
     let metadata = extract_metadata(&raw);
     let display_name =
         select_script_display_name(&metadata.display_names).unwrap_or_else(|| id.clone());
-    let description = select_script_description(&metadata.descriptions)
-        .unwrap_or_else(|| format!("User script: {id}"));
-    let parameters = json!({
-        "type": "object",
-        "properties": {
-            "stdin": {
-                "type": "string",
-                "description": t("Optional raw stdin input. If omitted, all arguments are sent as JSON via stdin.", "可选的原始 stdin 输入。省略时所有参数以 JSON 形式通过 stdin 传入。")
-            }
-        },
-        "additionalProperties": true
-    });
-    Some(ScriptEntry {
+    let description = select_script_description(&metadata.descriptions);
+    Some(DetectedScript {
         id,
         display_name,
+        description,
+    })
+}
+
+#[cfg(test)]
+fn auto_detect_script(path: &Path) -> Option<ScriptEntry> {
+    let detected = inspect_script(path)?;
+    let description = detected.description?;
+    Some(ScriptEntry {
+        id: detected.id,
+        display_name: detected.display_name,
         description,
         path: path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string(),
-        parameters,
+        parameters: Value::Null,
         timeout_seconds: None,
+        always_loaded: Some(true),
+        load_policy: LoadPolicy::Summary,
+        groups: Vec::new(),
     })
 }
 
@@ -213,11 +342,10 @@ fn extract_description(raw: &str) -> Option<String> {
     select_script_description(&extract_metadata(raw).descriptions)
 }
 
-fn description_from_script(path: &Path, id: &str) -> String {
+fn description_from_script(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| extract_description(&raw))
-        .unwrap_or_else(|| format!("User script: {id}"))
 }
 
 fn select_script_description(descriptions: &ScriptDescriptions) -> Option<String> {
@@ -324,11 +452,13 @@ fn entry_to_spec(entry: &ScriptEntry, scripts_dir: &Path) -> Result<ToolSpec> {
     } else {
         entry.display_name.clone()
     };
-    let description = if entry.description.is_empty() {
-        format!("User script: {id}")
-    } else {
-        entry.description.clone()
-    };
+    if entry.description.trim().is_empty() {
+        bail!("registered script is missing a description: {id}");
+    }
+    let description = entry.description.clone();
+    let always_loaded = entry
+        .always_loaded
+        .unwrap_or_else(|| entry.parameters.is_null());
     let parameters = if entry.parameters.is_null() {
         json!({
             "type": "object",
@@ -356,8 +486,21 @@ fn entry_to_spec(entry: &ScriptEntry, scripts_dir: &Path) -> Result<ToolSpec> {
         async move { run_script(&path_str, &scripts_dir, &args, timeout).await }
     })
     .writes()
-    .with_display_name(display_name);
+    .with_display_name(display_name)
+    .with_always_loaded(always_loaded)
+    .with_load_policy(entry.load_policy)
+    .with_groups(entry.groups.clone())
+    .script();
     Ok(spec)
+}
+
+fn parse_load_policy(value: &str) -> Result<LoadPolicy> {
+    match value.trim() {
+        "" | "summary" | "lazy" => Ok(LoadPolicy::Summary),
+        "group" => Ok(LoadPolicy::Group),
+        "hidden" => Ok(LoadPolicy::Hidden),
+        other => bail!("invalid load_policy: {other}"),
+    }
 }
 
 async fn run_script(
@@ -386,6 +529,7 @@ async fn run_script(
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
 
     let mut child = command.spawn()?;
     if !stdin_input.is_empty() {
@@ -442,14 +586,8 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn register_script_tools(
-    registry: &mut ToolRegistry,
-    scripts_dir: PathBuf,
-    system_scripts_dir: PathBuf,
-) {
+fn register_script_tools(registry: &mut ToolRegistry, scripts_dir: PathBuf) {
     let scripts_dir_2 = scripts_dir.clone();
-    let scripts_dir_3 = scripts_dir.clone();
-    let system_scripts_dir_2 = system_scripts_dir.clone();
     registry.register(ToolSpec::new(
         "register_script",
         t(
@@ -474,7 +612,7 @@ fn register_script_tools(
                 },
                 "path": {
                     "type": "string",
-                    "description": t("Script file name or relative/absolute path.", "脚本文件名或相对/绝对路径。")
+                    "description": t("Script file name or path within the user scripts directory.", "用户 scripts 目录内的脚本文件名或路径。")
                 },
                 "parameters": {
                     "type": "object",
@@ -483,6 +621,20 @@ fn register_script_tools(
                 "timeout_seconds": {
                     "type": "integer",
                     "description": t("Optional timeout in seconds, max 300.", "可选超时时间，单位秒，最大 300。")
+                },
+                "always_loaded": {
+                    "type": "boolean",
+                    "description": t("Optional loading override. By default scripts with a custom schema are loaded on demand, while scripts using generic stdin are always visible.", "可选加载策略覆盖。默认有自定义 schema 的脚本按需加载，使用通用 stdin 的脚本始终可见。")
+                },
+                "load_policy": {
+                    "type": "string",
+                    "enum": ["summary", "group", "hidden"],
+                    "description": t("Hybrid catalog policy. summary shows this script as a single load target, group exposes it through group:<name>, hidden keeps it out of the catalog.", "Hybrid 工具目录策略。summary 将脚本作为单独加载目标展示；group 通过 group:<name> 展示；hidden 不展示在目录中。")
+                },
+                "groups": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": t("Optional hybrid catalog groups, e.g. gaming or systeminfo.", "可选 Hybrid 目录分组，例如 gaming 或 systeminfo。")
                 }
             },
             "required": ["id", "path"],
@@ -520,24 +672,6 @@ fn register_script_tools(
             async move { unregister_script_handler(args, &scripts_dir).await }
         },
     ).writes());
-
-    registry.register(ToolSpec::new(
-        "list_scripts",
-        t(
-            "List all registered script tools, including both system and user scripts. Returns id, display name, description, path, and source for each script.",
-            "列出所有已注册的脚本工具，包括系统脚本和用户脚本。返回每个脚本的 id、显示名称、描述、路径和来源。"
-        ),
-        json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        move |_args| {
-            let scripts_dir = scripts_dir_3.clone();
-            let system_scripts_dir = system_scripts_dir_2.clone();
-            async move { list_scripts_handler(&scripts_dir, &system_scripts_dir).await }
-        },
-    ));
 }
 
 async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<String> {
@@ -550,16 +684,13 @@ async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<Stri
     if id.is_empty() {
         bail!("id is required");
     }
-    if !id
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_alphabetic())
-        .unwrap_or(false)
-        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !is_valid_registered_script_id(&id) {
         bail!(
             "id must start with an ASCII letter and contain only ASCII alphanumeric and underscore"
         );
+    }
+    if is_reserved_script_id(&id) {
+        bail!("script id conflicts with a reserved tool name: {id}");
     }
     let display_name = args
         .get("display_name")
@@ -582,23 +713,48 @@ async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<Stri
     if path.is_empty() {
         bail!("path is required");
     }
-    let script_path = resolve_script_path(&path, scripts_dir);
-    if !script_path.is_file() {
-        bail!("script file not found: {}", script_path.display());
+    let unresolved_path = resolve_script_path(&path, scripts_dir);
+    if !unresolved_path.is_file() {
+        bail!("script file not found: {}", unresolved_path.display());
     }
+    let script_path = ensure_path_within_root(&unresolved_path, scripts_dir)?;
     make_executable(&script_path)?;
 
     let description = if description_override.is_empty() {
-        description_from_script(&script_path, &id)
+        description_from_script(&script_path).unwrap_or_default()
     } else {
         description_override
     };
+    if description.is_empty() {
+        bail!("description is required when the script header has no Description/描述 metadata");
+    }
 
     let parameters = args.get("parameters").cloned().unwrap_or(Value::Null);
     let timeout_seconds = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)
         .map(|v| v.min(300));
+    let always_loaded = args.get("always_loaded").and_then(Value::as_bool);
+    let load_policy = args
+        .get("load_policy")
+        .and_then(Value::as_str)
+        .map(parse_load_policy)
+        .transpose()?
+        .unwrap_or_default();
+    let groups = args
+        .get("groups")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stored_path = relative_script_path(&script_path, scripts_dir);
 
     let entry = ScriptEntry {
         id: id.clone(),
@@ -608,27 +764,31 @@ async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<Stri
             display_name
         },
         description,
-        path,
+        path: stored_path.clone(),
         parameters,
         timeout_seconds,
+        always_loaded,
+        load_policy,
+        groups,
     };
 
     let index_path = scripts_dir.join("index.json");
-    let mut index: ScriptIndex = if index_path.is_file() {
-        let raw = std::fs::read_to_string(&index_path)?;
-        serde_json::from_str(&raw).unwrap_or_default()
-    } else {
-        ScriptIndex::default()
-    };
-
-    if let Some(existing) = index.scripts.iter_mut().find(|s| s.id == id) {
-        *existing = entry.clone();
-    } else {
-        index.scripts.push(entry.clone());
+    let mut index = read_script_index_value(&index_path)?;
+    {
+        let scripts = index_array_mut(&mut index, "scripts")?;
+        let entry = serde_json::to_value(&entry)?;
+        scripts.retain(|script| raw_entry_field(script, "id") != Some(id.as_str()));
+        scripts.push(entry);
     }
+    let script_key = canonicalize_key(&script_path);
+    index_array_mut(&mut index, "disabled")?.retain(|disabled| {
+        raw_entry_field(disabled, "id") != Some(id.as_str())
+            && raw_entry_field(disabled, "path")
+                .map(|path| canonicalize_key(&resolve_script_path(path, scripts_dir)) != script_key)
+                .unwrap_or(true)
+    });
 
-    std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)
-        .with_context(|| format!("failed to write {}", index_path.display()))?;
+    write_script_index_value(&index_path, &index)?;
 
     Ok(format!(
         "Script '{id}' registered successfully. It will be available as a tool in the next tool call round. The script path is: {}",
@@ -652,35 +812,50 @@ async fn unregister_script_handler(args: Value, scripts_dir: &Path) -> Result<St
         .unwrap_or(false);
 
     let index_path = scripts_dir.join("index.json");
-    if !index_path.is_file() {
-        bail!("no scripts registered (index.json not found)");
-    }
+    let mut index = read_script_index_value(&index_path)?;
 
-    let raw = std::fs::read_to_string(&index_path)?;
-    let mut index: ScriptIndex = serde_json::from_str(&raw).unwrap_or_default();
-
-    let entry = index.scripts.iter().find(|s| s.id == id).cloned();
-    let Some(entry) = entry else {
-        bail!("script id '{id}' not found in index");
+    let indexed_path = index
+        .get("scripts")
+        .and_then(Value::as_array)
+        .and_then(|scripts| {
+            scripts
+                .iter()
+                .filter(|script| raw_entry_field(script, "id") == Some(id.as_str()))
+                .find_map(|script| raw_entry_field(script, "path"))
+        })
+        .map(str::to_string);
+    let path = if let Some(path) = indexed_path {
+        path
+    } else {
+        find_auto_detected_path(scripts_dir, &id)?
+            .ok_or_else(|| anyhow::anyhow!("script id '{id}' not found"))?
     };
 
-    index.scripts.retain(|s| s.id != id);
-    std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)?;
+    index_array_mut(&mut index, "scripts")?
+        .retain(|script| raw_entry_field(script, "id") != Some(id.as_str()));
 
     let mut deleted_file = false;
+    let unresolved_path = resolve_script_path(&path, scripts_dir);
     if delete_file {
-        let script_path = resolve_script_path(&entry.path, scripts_dir);
-        let canon_script = script_path
-            .canonicalize()
-            .unwrap_or_else(|_| script_path.clone());
-        let canon_dir = scripts_dir
-            .canonicalize()
-            .unwrap_or_else(|_| scripts_dir.to_path_buf());
-        if canon_script.starts_with(&canon_dir) && canon_script.is_file() {
-            std::fs::remove_file(&canon_script)?;
+        if unresolved_path.is_file() {
+            let script_path = ensure_path_within_root(&unresolved_path, scripts_dir)?;
+            std::fs::remove_file(&script_path)?;
             deleted_file = true;
         }
+        index_array_mut(&mut index, "disabled")?.retain(|disabled| {
+            raw_entry_field(disabled, "id") != Some(id.as_str())
+                && raw_entry_field(disabled, "path") != Some(path.as_str())
+        });
+    } else {
+        let disabled = index_array_mut(&mut index, "disabled")?;
+        disabled.retain(|entry| {
+            raw_entry_field(entry, "id") != Some(id.as_str())
+                && raw_entry_field(entry, "path") != Some(path.as_str())
+        });
+        disabled.push(json!({"id": id, "path": path}));
     }
+
+    write_script_index_value(&index_path, &index)?;
 
     Ok(format!(
         "Script '{}' unregistered successfully{}.",
@@ -688,43 +863,99 @@ async fn unregister_script_handler(args: Value, scripts_dir: &Path) -> Result<St
         if deleted_file {
             " and file deleted"
         } else {
-            ""
+            " and file disabled"
         }
     ))
 }
 
-async fn list_scripts_handler(scripts_dir: &Path, system_scripts_dir: &Path) -> Result<String> {
-    let dirs = [system_scripts_dir, scripts_dir];
-    let entries = scan_scripts(&dirs)?;
+fn read_script_index_value(index_path: &Path) -> Result<Value> {
+    if !index_path.is_file() {
+        return Ok(json!({"scripts": [], "disabled": []}));
+    }
+    let raw = std::fs::read_to_string(index_path)?;
+    let value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    if !value.is_object() {
+        bail!(
+            "script index root must be an object: {}",
+            index_path.display()
+        );
+    }
+    Ok(value)
+}
 
-    let canon_sys = system_scripts_dir
-        .canonicalize()
-        .unwrap_or_else(|_| system_scripts_dir.to_path_buf());
-
-    let scripts: Vec<Value> = entries
-        .iter()
-        .map(|entry| {
-            let path = Path::new(&entry.path);
-            let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let source = if canon_path.starts_with(&canon_sys) {
-                "system"
-            } else {
-                "user"
-            };
-            json!({
-                "id": entry.id,
-                "display_name": entry.display_name,
-                "description": entry.description,
-                "path": entry.path,
-                "source": source,
-            })
-        })
+fn read_script_index_for_scan(index_path: &Path) -> Result<ScriptIndex> {
+    if !index_path.is_file() {
+        return Ok(ScriptIndex::default());
+    }
+    let raw = std::fs::read_to_string(index_path)?;
+    let value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let scripts = value
+        .get("scripts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
         .collect();
+    let disabled = value
+        .get("disabled")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+        .collect();
+    Ok(ScriptIndex { scripts, disabled })
+}
 
-    Ok(serde_json::to_string_pretty(&json!({
-        "scripts": scripts,
-        "total": entries.len(),
-    }))?)
+fn index_array_mut<'a>(index: &'a mut Value, key: &str) -> Result<&'a mut Vec<Value>> {
+    let object = index
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("script index root must be an object"))?;
+    let value = object.entry(key.to_string()).or_insert_with(|| json!([]));
+    if !value.is_array() {
+        *value = json!([]);
+    }
+    Ok(value.as_array_mut().expect("array was just initialized"))
+}
+
+fn raw_entry_field<'a>(entry: &'a Value, field: &str) -> Option<&'a str> {
+    entry.get(field).and_then(Value::as_str)
+}
+
+fn write_script_index_value(index_path: &Path, index: &Value) -> Result<()> {
+    let file_name = index_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index.json");
+    let temp_path = index_path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&temp_path, serde_json::to_string_pretty(index)?)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    if let Err(error) = std::fs::rename(&temp_path, index_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("failed to replace {}", index_path.display()));
+    }
+    Ok(())
+}
+
+fn find_auto_detected_path(scripts_dir: &Path, id: &str) -> Result<Option<String>> {
+    if !scripts_dir.is_dir() {
+        return Ok(None);
+    }
+    for file_entry in std::fs::read_dir(scripts_dir)? {
+        let file_entry = file_entry?;
+        let path = file_entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(detected) = inspect_script(&path) else {
+            continue;
+        };
+        if detected.id == id {
+            return Ok(Some(relative_script_path(&path, scripts_dir)));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -839,9 +1070,10 @@ mod tests {
             "#!/bin/bash\ndescription: Greet user\n\necho hi",
         )
         .unwrap();
-        let entries = scan_scripts(&[scripts_dir]).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "greet");
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "greet");
+        assert!(scan.unregistered.is_empty());
     }
 
     #[test]
@@ -859,9 +1091,9 @@ mod tests {
             "#!/bin/bash\ndescription: Auto detected\n\necho auto",
         )
         .unwrap();
-        let entries = scan_scripts(&[scripts_dir]).unwrap();
-        assert_eq!(entries.len(), 2);
-        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 2);
+        let ids: Vec<&str> = scan.entries.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"custom"));
         assert!(ids.contains(&"auto"));
     }
@@ -880,9 +1112,9 @@ mod tests {
             "#!/bin/bash\n# Description: Custom header description\n\necho custom",
         )
         .unwrap();
-        let entries = scan_scripts(&[scripts_dir]).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].description, "Custom header description");
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].description, "Custom header description");
     }
 
     #[tokio::test]
@@ -925,8 +1157,8 @@ mod tests {
             r#"{"scripts":[{"id":"alias1","display_name":"A1","description":"alias","path":"dup.sh"}]}"#,
         )
         .unwrap();
-        let entries = scan_scripts(&[scripts_dir]).unwrap();
-        assert_eq!(entries.len(), 1);
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
     }
 
     #[test]
@@ -943,9 +1175,346 @@ mod tests {
             "#!/bin/bash\ndescription: User version\n\necho user",
         )
         .unwrap();
-        let entries = scan_scripts(&[sys_temp.path(), user_temp.path()]).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].description, "User version");
+        let scan = scan_scripts(&[sys_temp.path(), user_temp.path()]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].description, "User version");
+    }
+
+    #[test]
+    fn scan_lists_scripts_without_descriptions_as_unregistered() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(scripts_dir.join("unknown.sh"), "#!/bin/bash\necho unknown").unwrap();
+
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.unregistered.len(), 1);
+        assert_eq!(scan.unregistered[0].name, "unknown");
+        assert_eq!(
+            scan.unregistered[0].path,
+            scripts_dir.join("unknown.sh").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn explicit_schema_defaults_to_lazy_loading() {
+        let entry = ScriptEntry {
+            id: "search_game".to_string(),
+            display_name: "Search game".to_string(),
+            description: "Search game status".to_string(),
+            path: "search-game".to_string(),
+            parameters: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            timeout_seconds: None,
+            always_loaded: None,
+            load_policy: LoadPolicy::Summary,
+            groups: Vec::new(),
+        };
+        let spec = entry_to_spec(&entry, Path::new(".")).unwrap();
+        assert!(!spec.always_loaded);
+        assert!(spec.is_script);
+    }
+
+    #[test]
+    fn scan_drives_top_level_and_available_script_visibility() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("generic.sh"),
+            "#!/bin/bash\n# Description: Generic script\n\necho generic",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("lazy.sh"),
+            "#!/bin/bash\n# Description: Lazy script\n\necho lazy",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("index.json"),
+            serde_json::to_string(&json!({
+                "scripts": [
+                    {
+                        "id": "generic_script",
+                        "display_name": "Generic",
+                        "description": "Generic script",
+                        "path": "generic.sh"
+                    },
+                    {
+                        "id": "lazy_script",
+                        "display_name": "Lazy",
+                        "description": "Lazy script",
+                        "path": "lazy.sh",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}}
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        let specs = script_specs(&scan.entries, scripts_dir);
+        let mut registry = ToolRegistry::new();
+        super::super::load_tools::register(&mut registry);
+        registry
+            .replace_script_tools(specs, scan.unregistered)
+            .unwrap();
+
+        let definitions = registry.lazy_definitions(&BTreeSet::new());
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("generic_script"));
+        assert!(!names.contains("lazy_script"));
+        let load_tools = definitions
+            .iter()
+            .find(|definition| definition.function.name == "load_tools")
+            .unwrap();
+        assert!(load_tools
+            .function
+            .description
+            .contains("<available_load_targets>"));
+        assert!(load_tools.function.description.contains("lazy_script"));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_reserved_tool_names_before_writing_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("weather.sh"),
+            "#!/bin/bash\n# Description: Fake weather\n\necho fake",
+        )
+        .unwrap();
+
+        let error =
+            register_script_handler(json!({"id":"get_weather","path":"weather.sh"}), scripts_dir)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("reserved tool name"));
+        assert!(!scripts_dir.join("index.json").exists());
+    }
+
+    #[test]
+    fn invalid_external_index_entry_does_not_hide_valid_local_scripts() {
+        let scripts_temp = tempfile::tempdir().unwrap();
+        let external_temp = tempfile::tempdir().unwrap();
+        let scripts_dir = scripts_temp.path();
+        let external_script = external_temp.path().join("external.sh");
+        std::fs::write(
+            &external_script,
+            "#!/bin/bash\n# Description: External\n\necho external",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("local.sh"),
+            "#!/bin/bash\n# Description: Local\n\necho local",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("index.json"),
+            serde_json::to_string(&json!({
+                "scripts": [{
+                    "id": "external_script",
+                    "display_name": "External",
+                    "description": "External",
+                    "path": external_script
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "local");
+    }
+
+    #[test]
+    fn malformed_index_entries_do_not_hide_valid_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("valid.sh"),
+            "#!/bin/bash\n# Description: Valid\n\necho valid",
+        )
+        .unwrap();
+        std::fs::write(scripts_dir.join("invalid.sh"), "not a script").unwrap();
+        std::fs::write(
+            scripts_dir.join("index.json"),
+            serde_json::to_string(&json!({
+                "scripts": [
+                    "broken entry",
+                    {
+                        "id": "",
+                        "display_name": "Invalid",
+                        "description": "Invalid",
+                        "path": "invalid.sh"
+                    },
+                    {
+                        "id": "valid_script",
+                        "display_name": "Valid",
+                        "description": "Valid",
+                        "path": "valid.sh"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "valid_script");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutations_preserve_malformed_sibling_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("existing.sh"),
+            "#!/bin/bash\n# Description: Existing\n\necho existing",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("new.sh"),
+            "#!/bin/bash\n# Description: New\n\necho new",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("index.json"),
+            serde_json::to_string(&json!({
+                "scripts": [
+                    "broken entry",
+                    {
+                        "id": "existing_script",
+                        "display_name": "Existing",
+                        "description": "Existing",
+                        "path": "existing.sh"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        register_script_handler(json!({"id":"new_script","path":"new.sh"}), scripts_dir)
+            .await
+            .unwrap();
+        unregister_script_handler(
+            json!({"id":"existing_script","delete_file":false}),
+            scripts_dir,
+        )
+        .await
+        .unwrap();
+
+        let index = read_script_index_value(&scripts_dir.join("index.json")).unwrap();
+        let scripts = index.get("scripts").and_then(Value::as_array).unwrap();
+        assert!(scripts.iter().any(|entry| entry == "broken entry"));
+        assert!(scripts
+            .iter()
+            .any(|entry| raw_entry_field(entry, "id") == Some("new_script")));
+        assert!(!scripts
+            .iter()
+            .any(|entry| raw_entry_field(entry, "id") == Some("existing_script")));
+        let disabled = index.get("disabled").and_then(Value::as_array).unwrap();
+        assert!(disabled
+            .iter()
+            .any(|entry| raw_entry_field(entry, "id") == Some("existing_script")));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutations_replace_and_remove_all_same_id_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("old.sh"),
+            "#!/bin/bash\n# Description: Old\n\necho old",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("new.sh"),
+            "#!/bin/bash\n# Description: New\n\necho new",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts_dir.join("index.json"),
+            serde_json::to_string(&json!({
+                "scripts": [
+                    {"id": "target_script", "path": 42},
+                    {
+                        "id": "target_script",
+                        "display_name": "Old",
+                        "description": "Old",
+                        "path": "old.sh"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        register_script_handler(json!({"id":"target_script","path":"new.sh"}), scripts_dir)
+            .await
+            .unwrap();
+
+        let index_path = scripts_dir.join("index.json");
+        let mut index = read_script_index_value(&index_path).unwrap();
+        let scripts = index_array_mut(&mut index, "scripts").unwrap();
+        assert_eq!(
+            scripts
+                .iter()
+                .filter(|entry| raw_entry_field(entry, "id") == Some("target_script"))
+                .count(),
+            1
+        );
+        assert_eq!(raw_entry_field(&scripts[0], "path"), Some("new.sh"));
+
+        scripts.insert(0, json!({"id": "target_script", "path": 42}));
+        write_script_index_value(&index_path, &index).unwrap();
+        unregister_script_handler(
+            json!({"id":"target_script","delete_file":false}),
+            scripts_dir,
+        )
+        .await
+        .unwrap();
+
+        let index = read_script_index_value(&index_path).unwrap();
+        let scripts = index.get("scripts").and_then(Value::as_array).unwrap();
+        assert!(!scripts
+            .iter()
+            .any(|entry| raw_entry_field(entry, "id") == Some("target_script")));
+        let disabled = index.get("disabled").and_then(Value::as_array).unwrap();
+        assert!(disabled.iter().any(|entry| {
+            raw_entry_field(entry, "id") == Some("target_script")
+                && raw_entry_field(entry, "path") == Some("new.sh")
+        }));
+    }
+
+    #[tokio::test]
+    async fn unregister_keeps_file_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path();
+        std::fs::write(
+            scripts_dir.join("hello.sh"),
+            "#!/bin/bash\n# Description: Say hello\n\necho hello",
+        )
+        .unwrap();
+
+        unregister_script_handler(json!({"id":"hello","delete_file":false}), scripts_dir)
+            .await
+            .unwrap();
+
+        assert!(scripts_dir.join("hello.sh").is_file());
+        let index = read_script_index_for_scan(&scripts_dir.join("index.json")).unwrap();
+        assert_eq!(index.disabled.len(), 1);
+        let scan = scan_scripts(&[scripts_dir]).unwrap();
+        assert!(scan.entries.is_empty());
+        assert!(scan.unregistered.is_empty());
     }
 
     #[cfg(unix)]

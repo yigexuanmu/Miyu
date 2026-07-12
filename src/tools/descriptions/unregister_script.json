@@ -1,7 +1,7 @@
 {
   "name": "unregister_script",
   "display_name": "注销脚本",
-  "description": "从工具索引中移除已注册的脚本。",
+  "description": "注销用户脚本。保留文件时会记录为禁用，防止被自动扫描重新注册。",
   "parameters": {
     "type": "object",
     "properties": {
@@ -19,5 +19,9 @@
     ]
   },
   "permission": "writes",
-  "always_loaded": false
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "scripting"
+  ]
 }

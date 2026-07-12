@@ -119,10 +119,9 @@ fn render_frame(frame: usize, state: &WaitSpinner) -> (String, u16) {
 }
 
 fn render_cell(char_index: usize, state: ScannerState) -> String {
-    let fade = fade_factor(state);
     match color_index(char_index, state) {
         Some(index) if index < TRAIL_LEN => paint_active_dot(index),
-        _ => paint_inactive_dot(fade),
+        _ => paint_inactive_dot(),
     }
 }
 
@@ -137,12 +136,8 @@ fn paint_active_dot(index: usize) -> String {
     }
 }
 
-fn paint_inactive_dot(fade: f64) -> String {
-    if fade > 0.24 {
-        format!("\x1b[2m\x1b[36m{INACTIVE_DOT}\x1b[0m")
-    } else {
-        format!("\x1b[2m\x1b[36m{INACTIVE_DOT}\x1b[0m")
-    }
+fn paint_inactive_dot() -> String {
+    format!("\x1b[2m\x1b[36m{INACTIVE_DOT}\x1b[0m")
 }
 
 fn total_frames_scanner() -> usize {
@@ -224,6 +219,7 @@ fn color_index(char_index: usize, state: ScannerState) -> Option<usize> {
     None
 }
 
+#[allow(dead_code)]
 fn fade_factor(state: ScannerState) -> f64 {
     if state.is_holding && state.hold_total > 0 {
         let progress = (state.hold_progress as f64 / state.hold_total as f64).min(1.0);
@@ -361,7 +357,7 @@ mod tests {
     #[test]
     fn active_and_inactive_dots_match_pr_style() {
         assert!(render_cell(4, scanner_state(4)).contains("▪"));
-        assert!(paint_inactive_dot(1.0).contains(INACTIVE_DOT));
+        assert!(paint_inactive_dot().contains(INACTIVE_DOT));
     }
 
     #[test]

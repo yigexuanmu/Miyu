@@ -11,7 +11,14 @@
       },
       "query_type": {
         "type": "string",
-        "enum": ["forecast", "air_quality", "historical", "marine", "climate", "elevation"],
+        "enum": [
+          "forecast",
+          "air_quality",
+          "historical",
+          "marine",
+          "climate",
+          "elevation"
+        ],
         "description": "查询类型。forecast=当前天气和预报，air_quality=空气质量，historical=历史天气，marine=海洋天气，climate=气候趋势，elevation=海拔；默认 forecast。"
       },
       "days": {
@@ -33,5 +40,9 @@
     }
   },
   "permission": "readonly",
-  "always_loaded": false
+  "always_loaded": true,
+  "load_policy": "summary",
+  "groups": [
+    "web"
+  ]
 }

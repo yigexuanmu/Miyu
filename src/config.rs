@@ -1,5 +1,6 @@
 use crate::default_models::{
-    OPENCODE_DEFAULT_CHAT_MODEL, OPENCODE_PROVIDER_ID, OPENCODE_ZEN_BASE_URL,
+    OPENCODE_DEFAULT_CHAT_MODEL, OPENCODE_DEFAULT_CONTEXT_WINDOW, OPENCODE_PROVIDER_ID,
+    OPENCODE_ZEN_BASE_URL,
 };
 use crate::paths::MiyuPaths;
 use crate::prompts::default_system_prompt;
@@ -121,6 +122,11 @@ pub struct ProviderConfig {
         skip_serializing_if = "is_default_temperature"
     )]
     pub temperature: f32,
+    #[serde(
+        default = "default_anthropic_max_tokens",
+        skip_serializing_if = "is_default_anthropic_max_tokens"
+    )]
+    pub anthropic_max_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +178,8 @@ pub struct ToolsConfig {
     pub max_rounds: usize,
     #[serde(default = "default_tools_loading_mode")]
     pub loading_mode: String,
+    #[serde(default = "default_true")]
+    pub persist_loaded_tools: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,6 +467,8 @@ pub struct MemesPluginConfig {
     pub height_percent: u8,
     #[serde(default = "default_memes_max_image_mb")]
     pub max_image_mb: u64,
+    #[serde(default = "default_memes_search_max_results")]
+    pub search_max_results: usize,
     #[serde(default)]
     pub allow_gif_animation: bool,
     #[serde(default)]
@@ -749,8 +759,9 @@ impl Default for MemesPluginConfig {
             width_percent: default_memes_width_percent(),
             height_percent: default_memes_height_percent(),
             max_image_mb: default_memes_max_image_mb(),
+            search_max_results: default_memes_search_max_results(),
             allow_gif_animation: false,
-            auto_send_enabled: true,
+            auto_send_enabled: false,
             auto_send_probability: default_memes_auto_send_probability(),
         }
     }
@@ -825,6 +836,7 @@ impl Default for ToolsConfig {
             enabled: default_true(),
             max_rounds: 0,
             loading_mode: default_tools_loading_mode(),
+            persist_loaded_tools: default_true(),
         }
     }
 }
@@ -874,6 +886,11 @@ impl Default for ContextConfig {
 
 impl ProviderConfig {
     pub fn default_opencodezen() -> Self {
+        let mut model_context_window = HashMap::new();
+        model_context_window.insert(
+            OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
+            OPENCODE_DEFAULT_CONTEXT_WINDOW,
+        );
         Self {
             id: OPENCODE_PROVIDER_ID.to_string(),
             display_name: "opencode Zen".to_string(),
@@ -881,11 +898,12 @@ impl ProviderConfig {
             protocol: default_provider_protocol(),
             api_key: None,
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
-            model_context_window: HashMap::new(),
+            model_context_window,
             model_modalities: HashMap::new(),
             default_model: OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
+            anthropic_max_tokens: default_anthropic_max_tokens(),
         }
     }
 
@@ -902,6 +920,24 @@ impl ProviderConfig {
             default_model: "gpt-4o-mini".to_string(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
+            anthropic_max_tokens: default_anthropic_max_tokens(),
+        }
+    }
+
+    pub fn default_anthropic() -> Self {
+        Self {
+            id: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            protocol: "anthropic".to_string(),
+            api_key: Some("$env:ANTHROPIC_API_KEY".to_string()),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            model_context_window: HashMap::new(),
+            model_modalities: HashMap::new(),
+            default_model: "claude-sonnet-4-5".to_string(),
+            timeout_seconds: default_timeout(),
+            temperature: default_temperature(),
+            anthropic_max_tokens: default_anthropic_max_tokens(),
         }
     }
 
@@ -909,6 +945,7 @@ impl ProviderConfig {
         let mut providers = vec![Self::default_opencodezen()];
         providers.extend([
             Self::template("openai", "OpenAI", "https://api.openai.com/v1"),
+            Self::default_anthropic(),
             Self::template("deepseek", "DeepSeek", "https://api.deepseek.com"),
             Self::template(
                 "gemini",
@@ -941,6 +978,7 @@ impl ProviderConfig {
             default_model: String::new(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
+            anthropic_max_tokens: default_anthropic_max_tokens(),
         }
     }
 
@@ -1175,6 +1213,51 @@ impl AppConfig {
         if self.plugins.knowledge_base.embedding_timeout_seconds == 0 {
             bail!("plugins.knowledge_base.embedding_timeout_seconds must be greater than 0");
         }
+        if !(0.0..=2.0).contains(&self.provider(None)?.temperature) {
+            bail!("provider temperature must be between 0.0 and 2.0");
+        }
+        for provider in &self.providers {
+            if provider.timeout_seconds == 0 {
+                bail!(
+                    "provider {} timeout_seconds must be greater than 0",
+                    provider.id
+                );
+            }
+            if !(0.0..=2.0).contains(&provider.temperature) {
+                bail!(
+                    "provider {} temperature must be between 0.0 and 2.0",
+                    provider.id
+                );
+            }
+            if provider.anthropic_max_tokens == 0 {
+                bail!(
+                    "provider {} anthropic_max_tokens must be greater than 0",
+                    provider.id
+                );
+            }
+        }
+        if !(0.0..=1.0).contains(&self.plugins.memes.auto_send_probability) {
+            bail!("plugins.memes.auto_send_probability must be between 0.0 and 1.0");
+        }
+        if self.plugins.memes.width_percent == 0 || self.plugins.memes.width_percent > 100 {
+            bail!("plugins.memes.width_percent must be between 1 and 100");
+        }
+        if self.plugins.memes.height_percent == 0 || self.plugins.memes.height_percent > 100 {
+            bail!("plugins.memes.height_percent must be between 1 and 100");
+        }
+        if self.plugins.memes.search_max_results == 0 || self.plugins.memes.search_max_results > 3 {
+            bail!("plugins.memes.search_max_results must be between 1 and 3");
+        }
+        let mem = self.memory_config();
+        if mem.forgetting_half_life_days <= 0.0 {
+            bail!("memory.forgetting_half_life_days must be greater than 0");
+        }
+        if mem.forget_after_days == 0 {
+            bail!("memory.forget_after_days must be greater than 0");
+        }
+        if !(0.0..=1.0).contains(&self.plugins.knowledge_base.semantic_min_score) {
+            bail!("plugins.knowledge_base.semantic_min_score must be between 0.0 and 1.0");
+        }
         self.provider(None)?;
         Ok(())
     }
@@ -1256,7 +1339,12 @@ impl AppConfig {
         {
             return Ok(Some(window));
         }
-        Ok(crate::models_cache::context_window(model).map(|w| w as usize))
+        if provider.id == OPENCODE_PROVIDER_ID && model == OPENCODE_DEFAULT_CHAT_MODEL {
+            return Ok(Some(OPENCODE_DEFAULT_CONTEXT_WINDOW));
+        }
+        Ok(crate::models_cache::context_window(model)
+            .map(|w| w as usize)
+            .or_else(|| default_context_window_for_provider_model(provider, model)))
     }
 
     pub fn system_prompt(&self, paths: &MiyuPaths) -> Result<String> {
@@ -1487,6 +1575,34 @@ fn is_default_temperature(value: &f32) -> bool {
     (*value - default_temperature()).abs() < f32::EPSILON
 }
 
+fn default_anthropic_max_tokens() -> u32 {
+    4096
+}
+
+fn is_default_anthropic_max_tokens(value: &u32) -> bool {
+    *value == default_anthropic_max_tokens()
+}
+
+fn default_context_window_for_provider_model(
+    provider: &ProviderConfig,
+    model: &str,
+) -> Option<usize> {
+    let provider_id = provider.id.to_ascii_lowercase();
+    let display_name = provider.display_name.to_ascii_lowercase();
+    let base_url = provider.base_url.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    let is_anthropic = provider_id == "anthropic"
+        || provider_id.contains("anthropic")
+        || display_name.contains("anthropic")
+        || base_url.contains("api.anthropic.com")
+        || base_url.contains("anthropic.com/v1");
+
+    if is_anthropic && model.starts_with("claude-") {
+        return Some(200_000);
+    }
+    None
+}
+
 fn default_provider_protocol() -> String {
     "auto".to_string()
 }
@@ -1500,7 +1616,7 @@ fn default_true() -> bool {
 }
 
 fn default_tools_loading_mode() -> String {
-    "lazy".to_string()
+    "hybrid".to_string()
 }
 
 fn default_reasoning_display() -> String {
@@ -1569,6 +1685,10 @@ fn default_memes_height_percent() -> u8 {
 
 fn default_memes_max_image_mb() -> u64 {
     10
+}
+
+fn default_memes_search_max_results() -> usize {
+    1
 }
 
 fn default_memes_auto_send_probability() -> f32 {
@@ -1734,7 +1854,7 @@ fn default_trim_batch_ratio() -> f32 {
 }
 
 fn default_on_overflow() -> String {
-    "pop".to_string()
+    "compact".to_string()
 }
 
 fn default_diff_display_context_lines() -> usize {
@@ -1774,9 +1894,14 @@ mod tests {
     #[test]
     fn provider_model_choices_ignore_unconfigured_models() {
         let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
         config.providers[0].models.clear();
         config.providers[0].default_model.clear();
-        assert!(config.provider_model_choices().is_empty());
+
+        assert!(!config
+            .provider_model_choices()
+            .iter()
+            .any(|choice| choice.provider_id == provider_id));
     }
 
     #[test]
@@ -1785,6 +1910,21 @@ mod tests {
 
         assert!(provider.models.is_empty());
         assert!(provider.default_model.is_empty());
+    }
+
+    #[test]
+    fn default_anthropic_provider_uses_family_context_window_fallback() {
+        let mut config = AppConfig::default();
+        config.active_provider = "anthropic".to_string();
+
+        assert_eq!(config.active_context_window().unwrap(), Some(200_000));
+    }
+
+    #[test]
+    fn anthropic_template_does_not_hardcode_model_context_window() {
+        let provider = ProviderConfig::default_anthropic();
+
+        assert!(provider.model_context_window.is_empty());
     }
 
     #[test]
@@ -1827,7 +1967,10 @@ mod tests {
 
         assert!(config.providers[0].models.is_empty());
         assert!(config.providers[0].default_model.is_empty());
-        assert!(config.provider_model_choices().is_empty());
+        assert!(!config
+            .provider_model_choices()
+            .iter()
+            .any(|choice| choice.provider_id == provider_id));
     }
 
     #[test]
@@ -1848,7 +1991,8 @@ mod tests {
             memes.library_for_persona("Custom Persona"),
             "custom-persona"
         );
-        assert!(memes.auto_send_enabled);
+        assert!(!memes.auto_send_enabled);
+        assert_eq!(memes.search_max_results, 1);
         assert_eq!(memes.auto_send_probability, 0.2);
     }
 }

@@ -63,17 +63,19 @@ pub fn readable_tool_name(name: &str) -> String {
         return format!("加载技能：{skill}");
     }
     if let Some(tools) = name.strip_prefix("load_tools:") {
-        let display = tools
+        let targets = tools
             .split(',')
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .map(|name| {
-                tool_descriptions::get(name)
-                    .map(|desc| desc.display_name.clone())
-                    .unwrap_or_else(|| name.to_string())
-            })
+            .collect::<Vec<_>>();
+        let display = targets
+            .iter()
+            .map(|name| readable_load_target_name(name))
             .collect::<Vec<_>>()
             .join("、");
+        if targets.len() == 1 && targets[0].starts_with("group:") {
+            return format!("加载工具组：{display}");
+        }
         return format!("加载工具：{display}");
     }
     if let Ok(guard) = SCRIPT_DISPLAY_NAMES.read() {
@@ -84,6 +86,16 @@ pub fn readable_tool_name(name: &str) -> String {
         }
     }
     builtin_readable_tool_name(name).to_string()
+}
+
+fn readable_load_target_name(name: &str) -> String {
+    if let Some(group) = name.strip_prefix("group:") {
+        return tool_descriptions::group_display_name(group)
+            .unwrap_or_else(|| format!("group:{group}"));
+    }
+    tool_descriptions::get(name)
+        .map(|desc| desc.display_name.clone())
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn builtin_readable_tool_name(name: &str) -> String {
@@ -162,7 +174,6 @@ fn builtin_readable_tool_name(name: &str) -> String {
         "load_tools" => "加载工具",
         "register_script" => "注册脚本",
         "unregister_script" => "注销脚本",
-        "list_scripts" => "列出脚本",
         "todowrite" => "任务列表",
         "todoupdate" => "更新任务",
         "review_aur_package" => "审查 AUR 包",
@@ -259,7 +270,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let task_tools = registry.clone();
     task::register(&mut registry, config.clone(), paths.clone(), task_tools);
     scripts::register(&mut registry, paths);
-    if config.tools.loading_mode == "lazy" {
+    if is_hybrid_loading_mode(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
 
@@ -312,10 +323,14 @@ pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry 
     if config.memory_config().enabled {
         memory::register_readonly(&mut registry, config.clone(), paths.clone());
     }
-    if config.tools.loading_mode == "lazy" {
+    if is_hybrid_loading_mode(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
     registry
+}
+
+pub fn is_hybrid_loading_mode(mode: &str) -> bool {
+    matches!(mode.trim(), "hybrid" | "lazy")
 }
 
 pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {

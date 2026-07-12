@@ -6,6 +6,7 @@ use crate::paths::MiyuPaths;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 pub use conversation_db::{
     interrupted_text, pending_placeholder, ConversationDb, Turn, TurnStatus,
 };
+pub use usage::UsageSnapshot;
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
@@ -49,6 +51,7 @@ impl StateStore {
         let previous = std::fs::read_to_string(&file).unwrap_or_default();
         if previous.trim() != fingerprint {
             self.conv_db.reset()?;
+            self.clear_last_usage()?;
             std::fs::write(file, format!("{fingerprint}\n"))?;
         }
         Ok(())
@@ -94,23 +97,36 @@ impl StateStore {
         )
     }
 
-    pub fn append_tool_report_context(
+    pub fn append_persisted_context(&self, turn_id: &str, report: &str) -> Result<()> {
+        self.conv_db.append_tool_report(turn_id, report.trim())
+    }
+
+    pub fn load_session_loaded_tools(&self) -> Result<BTreeSet<String>> {
+        self.conv_db.load_session_loaded_items("tool")
+    }
+
+    pub fn add_session_loaded_tools(
         &self,
-        turn_id: &str,
-        tool_name: &str,
-        report: &str,
+        names: &[String],
+        source_turn_id: Option<&str>,
     ) -> Result<()> {
-        self.conv_db.append_tool_report(
-            turn_id,
-            &format!(
-                "<previous_tool_report name=\"{tool_name}\">\n{}\n</previous_tool_report>",
-                report.trim()
-            ),
-        )
+        self.conv_db
+            .add_session_loaded_items("tool", names, source_turn_id)?;
+        Ok(())
+    }
+
+    pub fn add_session_loaded_targets(
+        &self,
+        names: &[String],
+        source_turn_id: Option<&str>,
+    ) -> Result<()> {
+        self.conv_db
+            .add_session_loaded_items("target", names, source_turn_id)?;
+        Ok(())
     }
 
     pub fn mark_interrupted_turn_if_needed(&self) -> Result<bool> {
-        Ok(false)
+        self.conv_db.mark_interrupted_running_turns()
     }
 
     pub fn recover_stale_turns(&self) -> Result<usize> {
@@ -149,6 +165,10 @@ impl StateStore {
 
     pub fn hide_turns_before_seq(&self, seq: i64) -> Result<usize> {
         self.conv_db.hide_turns_before_seq(seq)
+    }
+
+    pub fn delete_hidden_turns(&self) -> Result<usize> {
+        self.conv_db.delete_hidden_turns()
     }
 
     pub fn insert_summary_turn(
@@ -191,7 +211,8 @@ impl StateStore {
     }
 
     pub fn reset_conversation(&self) -> Result<()> {
-        self.conv_db.reset()
+        self.conv_db.reset()?;
+        self.clear_last_usage()
     }
 
     pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
@@ -201,6 +222,20 @@ impl StateStore {
     pub fn add_usage(&self, usage: &Usage) -> Result<()> {
         self.init_files()?;
         usage::add_usage(&self.usage_file(), usage)
+    }
+
+    pub fn add_auxiliary_usage(&self, usage: &Usage) -> Result<()> {
+        self.init_files()?;
+        usage::add_auxiliary_usage(&self.usage_file(), usage)
+    }
+
+    #[allow(dead_code)]
+    pub fn usage_snapshot(&self) -> Result<UsageSnapshot> {
+        usage::snapshot(&self.usage_file())
+    }
+
+    pub fn clear_last_usage(&self) -> Result<()> {
+        usage::clear_last_usage(&self.usage_file())
     }
 
     pub fn token_total(&self) -> Result<u64> {
@@ -256,6 +291,7 @@ fn prompt_fingerprint(system_prompt: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[allow(dead_code)]
 fn turn_chars(turn: &Turn) -> usize {
     turn.user_content.chars().count()
         + turn.assistant_content.chars().count()
@@ -273,7 +309,13 @@ fn turn_chars(turn: &Turn) -> usize {
 }
 
 fn turn_estimated_tokens(turn: &Turn) -> usize {
-    (turn_chars(turn) / 4).max(1)
+    crate::agent::overflow::estimate_tokens(&format!(
+        "{}{}{}{}",
+        turn.user_content,
+        turn.assistant_content,
+        turn.assistant_reasoning.as_deref().unwrap_or(""),
+        turn.tool_reports.join("")
+    ))
 }
 
 fn turns_to_entries(turns: Vec<Turn>) -> Vec<StoredConversationEntry> {
@@ -537,6 +579,23 @@ mod tests {
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().any(|t| t.is_summary));
         assert!(visible.iter().any(|t| !t.is_summary));
+    }
+
+    #[test]
+    fn session_loaded_tools_persist_until_reset() {
+        let (_temp, store) = test_store();
+        store
+            .add_session_loaded_tools(&["web_search".to_string()], Some("t1"))
+            .unwrap();
+        store
+            .add_session_loaded_targets(&["group:gaming".to_string()], Some("t1"))
+            .unwrap();
+
+        let loaded = store.load_session_loaded_tools().unwrap();
+        assert!(loaded.contains("web_search"));
+
+        store.reset_conversation().unwrap();
+        assert!(store.load_session_loaded_tools().unwrap().is_empty());
     }
 
     #[test]

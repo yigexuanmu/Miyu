@@ -1,6 +1,6 @@
 use crate::llm::{ChatContent, ChatMessage, Usage};
 
-const CHARS_PER_TOKEN: usize = 4;
+const IMAGE_TOKEN_ESTIMATE: usize = 765;
 const RESERVED_RATIO: f32 = 0.1;
 const MIN_RESERVED_TOKENS: usize = 4096;
 
@@ -61,39 +61,41 @@ impl OverflowCheck {
 
 #[allow(dead_code)]
 pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
-    let chars: usize = messages.iter().map(message_chars).sum();
-    (chars / CHARS_PER_TOKEN).max(1)
+    let tokens: usize = messages.iter().map(message_tokens).sum();
+    tokens.max(1)
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() / CHARS_PER_TOKEN).max(1)
+    crate::token_estimate::estimate_tokens(text).max(1)
+}
+
+fn text_tokens(text: &str) -> usize {
+    crate::token_estimate::estimate_tokens(text)
 }
 
 #[allow(dead_code)]
-fn message_chars(msg: &ChatMessage) -> usize {
-    let role_chars = msg.role.chars().count();
-    let content_chars = match &msg.content {
-        Some(ChatContent::Text(s)) => s.chars().count(),
+fn message_tokens(msg: &ChatMessage) -> usize {
+    let role_tokens = text_tokens(&msg.role);
+    let content_tokens = match &msg.content {
+        Some(ChatContent::Text(s)) => text_tokens(s),
         Some(ChatContent::Parts(parts)) => parts
             .iter()
             .map(|p| match p {
-                crate::llm::ChatContentPart::Text { text } => text.chars().count(),
-                crate::llm::ChatContentPart::ImageUrl { image_url } => {
-                    image_url.url.chars().count()
-                }
+                crate::llm::ChatContentPart::Text { text } => text_tokens(text),
+                crate::llm::ChatContentPart::ImageUrl { .. } => IMAGE_TOKEN_ESTIMATE,
             })
             .sum(),
         None => 0,
     };
-    let tool_chars = msg
+    let tool_tokens = msg
         .tool_calls
         .as_ref()
         .map(|calls| {
             calls
                 .iter()
-                .map(|c| c.function.name.chars().count() + c.function.arguments.chars().count())
+                .map(|c| text_tokens(&c.function.name) + text_tokens(&c.function.arguments))
                 .sum::<usize>()
         })
         .unwrap_or(0);
-    role_chars + content_chars + tool_chars
+    role_tokens + content_tokens + tool_tokens
 }
