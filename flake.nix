@@ -42,7 +42,7 @@
 
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "miyu";
-        version = "0.1.18";
+        version = (builtins.fromTOML (builtins.readFile "${miyu-src}/Cargo.toml")).package.version;
         src = miyu-src;
         cargoLock.lockFile = "${miyu-src}/Cargo.lock";
         nativeBuildInputs = [ pkgs.pkg-config ];
