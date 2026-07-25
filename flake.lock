@@ -18,22 +18,6 @@
         "type": "github"
       }
     },
-    "miyu-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1784477244,
-        "narHash": "sha256-pxYNnqhqJt6SEu8HcBk/HqafGI3RnQbC6wyU5tFdz/E=",
-        "owner": "SHORiN-KiWATA",
-        "repo": "Miyu",
-        "rev": "77f60cd34dcc6ae8cb4c0adbdd2155f7728984d9",
-        "type": "github"
-      },
-      "original": {
-        "owner": "SHORiN-KiWATA",
-        "repo": "Miyu",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1784356753,
@@ -53,7 +37,6 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "miyu-src": "miyu-src",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }
