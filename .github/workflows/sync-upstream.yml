@@ -1,0 +1,89 @@
+name: Sync upstream
+
+# 每天定时巡检上游 SHORiN-KiWATA/Miyu 是否有新提交；
+# 有则用 `nix flake update miyu-src` 更新 flake.lock 中的 miyu-src 节点，
+# 沿用 fork 历史中文 commit 风格提交并推送到 main，实现无人值守维护。
+# 也保留 workflow_dispatch 手动入口，方便应急同步。
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天 UTC 0:00（北京 8:00）
+  workflow_dispatch:
+
+permissions:
+  contents: write # 允许 push 到 main
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Configure git author
+        run: |
+          git config user.name "yigexuanmu"
+          git config user.email "yigexuanmu@users.noreply.github.com"
+
+      - name: Detect upstream update
+        id: check
+        run: |
+          git remote add upstream https://github.com/SHORiN-KiWATA/Miyu.git
+          git fetch upstream main --depth=1 --quiet
+          UP_REV=$(git rev-parse upstream/main)
+          CURRENT_REV=$(jq -r '.nodes["miyu-src"].locked.rev' flake.lock)
+          SHORT=$(git rev-parse --short "$UP_REV")
+          echo "upstream_rev=$UP_REV" >> "$GITHUB_OUTPUT"
+          echo "short_rev=$SHORT"      >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD : $UP_REV"
+          echo "Locked miyu-src: $CURRENT_REV"
+          if [ "$UP_REV" = "$CURRENT_REV" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Upstream unchanged, nothing to sync."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Upstream moved: $CURRENT_REV -> $UP_REV"
+          fi
+
+      - name: Update miyu-src input
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          nix --extra-experimental-features 'nix-command flakes' flake update miyu-src
+
+      - name: Commit and push
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          # 防御性：update 后 lock 理论上必有变化，没变说明异常，跳过提交
+          if git diff --exit-code -- flake.lock; then
+            echo "::warning::flake.lock unchanged after update, skip commit."
+            exit 0
+          fi
+
+          UP_REV="${{ steps.check.outputs.upstream_rev }}"
+          SHORT="${{ steps.check.outputs.short_rev }}"
+
+          # 版本号取自上游 Cargo.toml 的 package.version（与 flake.nix 读法一致）
+          VERSION=$(curl -fsSL \
+            "https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/${UP_REV}/Cargo.toml" \
+            | grep -E '^version' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+
+          if [ -n "$VERSION" ]; then
+            MSG="sync: 适配上游 v${VERSION} (miyu-src -> ${SHORT})"
+          else
+            MSG="sync: 跟进上游 (miyu-src -> ${SHORT})"
+          fi
+          echo "Commit message: $MSG"
+
+          git add flake.lock
+          git commit -m "$MSG"
+          git push
