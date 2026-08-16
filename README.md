@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="pics/miyu-logo.png" alt="Miyu" width="180">
+  <img src="https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/miyu-logo.png" alt="Miyu" width="180">
 </p>
 
 # Miyu
@@ -18,11 +18,11 @@ Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚
 
 `miyu` 可以与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
 
-![](./pics/shell-init.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/shell-init.png)
 
 有终端交互模式
 
-![](./pics/REPL.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/REPL.png)
 
 自带了 TUI 方便修改配置。
 
@@ -30,17 +30,17 @@ Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚
 miyu config
 ```
 
-![](./pics/tui.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/tui.png)
 
 还有 WebUI 
 
-![](./pics/webui.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/webui.png)
 
 还可以通过 NapCat 接入 QQ，远程操作电脑；亦或是加入群聊，陪网友吹水，帮助你管理群聊。
 
-![](./pics/qq私聊.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/qq私聊.png)
 
-![](./pics/qq群聊管理.png)
+![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/qq群聊管理.png)
 
 
 ## 如何安装？
@@ -184,7 +184,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
   
   表情包毫无疑问是聊天时最重要的部分，在对话时，Miyu 会根据情景自主发送符合情境的表情包。除了自主发送，设置里还可以设置概率、置信度和冷却时间。
 
-  ![](./pics/nvidiafuckyou.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/nvidiafuckyou.png)
 
   Miyu 自带了一些表情，存放在`/usr/share/miyu`，对应的用户空间目录位于`~/.miyu/data`。表情库是跟随人格的，如果你在设置里新建了自己的人格，那么就无法使用 Miyu 的默认表情。你可以准备一些图片，把路径给 Ai，让其保存到表情库。届时会自动调用识图模型对图片进行分析并保存。Miyu 默认使用 opencode 公共模型服务中的多模态模型进行识图，所以即使不配置自己的多模态模型也可以看图片。
 
@@ -194,9 +194,9 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
   
   算命就像看天气预报一般稀松平常。Miyu 自带了周易六十四卦、吉凶占、塔罗牌抽取等玄学功能。
 
-  ![](./pics/玄学.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/玄学.png)
 
-  ![](./pics/吉凶占.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/吉凶占.png)
 
 - 投骰子
 
@@ -204,7 +204,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   闲来无事可以和 AI 比比大小。
 
-  ![](./pics/骰子.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/骰子.png)
 
 - 闹钟
 
@@ -212,7 +212,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
   
   Miyu 自带了闹钟，日常泡泡面、番茄钟学习、计时任务什么的都很实用。内置了闹钟音频，你还可以通过路径传入你想要在到点后播放的“闹钟”。
 
-  ![](./pics/set_alarm.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/set_alarm.png)
 
 - 知识库
 
@@ -220,7 +220,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   当然，你也可以通过 `miyu kb` 命令，或者通过跟 AI 的自然语言交互管理属于你自己的知识库。
 
-  ![](./pics/kb.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/kb.png)
 
 - ProtonDB 查询
 
@@ -232,13 +232,13 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   这是桌面端使用 Linux 的日经问题，Miyu 会去 [ProtonDB](https://www.protondb.com/)、[Are We Anti-Cheat Yet?](https://areweanticheatyet.com/)、[Can I Play On Linux](https://caniplayonlinux.com/)等 Linux游戏兼容性资讯网站获取主要信息，辅以社区玩家的声音，综合判断一款游戏的兼容性并提出建议和注意事项。
 
-  ![](./pics/gaming.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/gaming.png)
 
 - 网络搜索
 
   即使不配置网络搜索 API，Miyu 也仍然拥有基础的网络搜索和网页读取能力：未配置任何搜索服务时会优先使用 Exa 的免 key 公共额度（每日限量，报错或超额后自动冷却并回退到内置爬虫搜索）。可以在插件配置中设置 Tavily、Firecrawl 、AnySearch、Exa、SearXNG 等网络搜索 API 以获得更佳的搜索效果。
 
-  ![](./pics/web-search-config.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/web-search-config.png)
 
 - 搜图
 
@@ -246,7 +246,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   >NSFW 禁止！
 
-  ![](./pics/搜图.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/搜图.png)
 
 - 生图
 
@@ -254,19 +254,19 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   >这个功能默认用不了，要自己在插件设置里开启并配置 API
 
-  ![](./pics/生图.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/生图.png)
 
 - 天气查询
 
   查询天气是每天的必做活动，当然少不了。
 
-  ![](./pics/weather.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/weather.png)
 
 - 汇率查询
 
   国际社会，查个汇率也很合理吧？
 
-  ![](./pics/汇率.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/汇率.png)
 
 - Man 手册查询
 
@@ -274,7 +274,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   专门的手册查询工具，虽然网络搜索也能做到，但这值得做成单独的插件。
   
-  ![](./pics/man.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/man.png)
 
 - Arch Linux相关
 
@@ -286,7 +286,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
     AUR 的状态是日用 Arch 时的重要信息之一，不访问网站就能查询的话，在 AUR 安装出现异常时查起来会方便很多。
 
-    ![](./pics/aur-status.png)
+    ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/aur-status.png)
 
   - AUR 包查询
 
@@ -296,13 +296,13 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
     作为 “Linux 圣经”，查询 Arch Wiki 不仅能提高日用 Arch 的体验，对其他发行版也大有裨益。
 
-    ![](./pics/archwiki.png)
+    ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/archwiki.png)
 
   - PKGBUILD 审查
 
     AUR 投毒的事件搞得人心惶惶，但现在，Miyu 可以帮忙审查 PKGBUILD 啦！
 
-    ![](./pics/pkgbuild审核.png)
+    ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/pkgbuild审核.png)
 
 - 文件操作
 
@@ -314,7 +314,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   为了计算结果的准确性，Miyu 自带了科学计算器和哈希编解码的能力。
 
-  ![](./pics/hash.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/hash.png)
 
 - 记忆系统
 
@@ -324,7 +324,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   `/reset` 只清理当前会话，不删除人格记忆；终端或 WebUI 的 `/reset all` 会清空当前人格的短期日记、长期日记、知识点、修订记录和待整理状态。主体记忆在一个事务中清理，淘汰上下文随后独立清理。即使后台模型当时正在整理，旧结果也会因数据库身份或记忆代数变化而被拒绝，不能在清理后重新写回；重置前已经启动的其他会话也不能再写入旧日记。
 
-  ![](./pics/记忆.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/记忆.png)
 
 - 深度研究
 
@@ -332,7 +332,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
   重量级插件。对于一个命题，Miyu 可以引经据典，有理有据地进行深度研究并写出研究报告。
 
-  ![](./pics/深度研究.png)
+  ![](https://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/深度研究.png)
 
 - Linux 输入法问题诊断
 
@@ -349,7 +349,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 #### 功能参考
 
 - [Opencode](https://github.com/anomalyco/opencode) 
-- [Claude Code](https://github.com/anthropics/claude-code)
+- [Claude Code](https://github.com/anthrohttps://raw.githubusercontent.com/SHORiN-KiWATA/Miyu/main/pics/claude-code)
 - [Pi](https://github.com/earendil-works/pi)
 - [Deepseek-Reasonix](https://github.com/esengine/deepseek-reasonix)
 - [Astrbot](https://github.com/AstrBotDevs/AstrBot) 
