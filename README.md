@@ -28,9 +28,15 @@
 
 ### Home Manager
 
-<<<<<<< HEAD
 ```nix
 { inputs, ... }:
+
+{
+  home.packages = [ inputs.miyu.packages.x86_64-linux.default ];
+}
+
+<<<<<<< HEAD
+
 =======
 - 从源码构建
 
@@ -273,9 +279,7 @@ PR时必须提供功能的设计理念，作用场景和实际意义。一个 PR
 </details>
 >>>>>>> upstream/main
 
-{
-  home.packages = [ inputs.miyu.packages.x86_64-linux.default ];
-}
+
 ```
 
 ## 致谢
