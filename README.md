@@ -4,9 +4,7 @@
 
 # 注意⚠️
 
-本仓库使用 Workflow 每天定时（UTC 0:00）或手动触发，先通过 git fetch 对比上游 commit 与本地 flake.lock 中的 miyu-src.rev 是否一致来判断是否有更新，若有变更则执行 nix flake update miyu-src 更新锁定文件，再从上源 Cargo.toml 动态提取版本号拼装提交信息，最后提交并推送到 main 分支，实现 Fork 仓库的无人值守同步。
-
-如果出现安装失败等问题，请提交Issue。
+本仓库使用 Workflow 每天定时更新（UTC 0:00），如果出现安装失败等问题，请提交Issue。
 
 # Miyu
 
@@ -16,7 +14,7 @@
 
 ## 谁是 Miyu？
 
-Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚构角色。
+Miyu 是从我（Shorin）曾经很喜欢的动画中的角色身上汲取灵感制作的虚构角色。
 
 ## 有什么功能？
 
