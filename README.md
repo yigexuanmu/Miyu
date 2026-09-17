@@ -51,29 +51,13 @@ miyu config
 
 ## 如何安装？
 
-- Arch Linux
-
-  ```
-  yay -S miyu
-  ```
-
-- 从源码构建
-
-  ```
-  git clone https://github.com/SHORiN-KiWATA/Miyu.git
-  cd Miyu
-  cargo build --release
-  ```
-
-- NixOS
-
   ### 1. 在 flake.nix 中添加输入
 
   ```nix
   {
     inputs = {
       nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-      miyu.url = "github:yigexuanmu/Miyu";
+      miyu.url = "github:yigexuanmu/miyu-agent-nix";
     };
   }
   ```
@@ -84,7 +68,7 @@ miyu config
   { inputs, ... }:
 
   {
-    environment.systemPackages = [ inputs.miyu.packages.x86_64-linux.default ];
+    environment.systemPackages = [ inputs.miyu-agent-nix.packages.x86_64-linux.default ];
   }
   ```
 
@@ -94,7 +78,7 @@ miyu config
   { inputs, ... }:
 
   {
-    home.packages = [ inputs.miyu.packages.x86_64-linux.default ];
+    home.packages = [ inputs.miyu-agent-nix.packages.x86_64-linux.default ];
   }
   ```
 
