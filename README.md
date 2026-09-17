@@ -55,7 +55,7 @@ miyu config
   {
     inputs = {
       nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-      miyu.url = "github:yigexuanmu/miyu-agent-nix";
+      miyu-agent-nix.url = "github:yigexuanmu/miyu-agent-nix";
     };
   }
   ```
